@@ -1,0 +1,128 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Provider mock chat</title>
+    <style>
+      body {
+        font: 16px Arial;
+        margin: 24px;
+      }
+      article {
+        padding: 16px;
+        border: 1px solid #ddd;
+        margin: 8px;
+      }
+      textarea {
+        width: 500px;
+        height: 80px;
+      }
+      button {
+        margin: 5px;
+        padding: 8px;
+      }
+      .markdown-prose {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <nav>
+      <button aria-label="User menu" data-testid="user-menu">Signed-in account</button
+      ><a href="/">New chat</a>
+    </nav>
+    <main id="messages"></main>
+    <textarea id="chat-input" placeholder="Message DeepSeek"></textarea>
+    <button id="send-message-button" aria-label="Send message" data-testid="send-button">
+      Send
+    </button>
+    <script>
+      const mode = localStorage.getItem('mock-mode') || 'stream';
+      window.fixture = { mode, clicks: 0, started: 0, finished: 0 };
+      const messages = document.querySelector('#messages');
+      const composer = document.querySelector('textarea');
+      const send = document.querySelector('#send-message-button');
+      function message(role, text) {
+        const article = document.createElement('article');
+        article.className = role + '-message';
+        article.dataset.messageRole = role;
+        const body = document.createElement('div');
+        body.dataset.messageContent = '';
+        body.className = 'markdown-prose ds-markdown';
+        body.textContent = text;
+        article.append(body);
+        messages.append(article);
+        return article;
+      }
+      function completed(article) {
+        const copy = document.createElement('button');
+        copy.setAttribute('aria-label', 'Copy');
+        copy.textContent = 'Copy';
+        article.append(copy);
+      }
+      if (location.pathname !== '/') {
+        message('user', 'Earlier user prompt');
+        completed(message('assistant', 'Earlier answer must never be returned'));
+      }
+      if (mode === 'draft') composer.value = 'User unsent draft';
+      if (mode === 'login') {
+        document.querySelector('nav').innerHTML = '<input type="password" placeholder="Sign in">';
+      }
+      if (mode === 'captcha-before') {
+        const c = document.createElement('div');
+        c.className = 'captcha';
+        c.textContent = 'Verify human';
+        document.body.append(c);
+      }
+      send.onclick = () => {
+        window.fixture.clicks++;
+        window.fixture.started = Date.now();
+        const prompt = composer.value;
+        composer.value = '';
+        send.disabled = true;
+        message('user', mode === 'wrong-user' ? 'Someone else prompt' : prompt);
+        if (mode === 'captcha') {
+          const c = document.createElement('div');
+          c.className = 'captcha';
+          c.textContent = 'Verify human';
+          messages.append(c);
+          return;
+        }
+        if (mode === 'quota') {
+          const c = document.createElement('div');
+          c.dataset.testid = 'quota-error';
+          c.textContent = 'Rate limit exceeded';
+          messages.append(c);
+          return;
+        }
+        if (mode === 'no-answer') return;
+        const stop = document.createElement('button');
+        stop.setAttribute('aria-label', 'Stop generating');
+        stop.textContent = 'Stop';
+        document.body.append(stop);
+        const assistant = message('assistant', 'Partial');
+        setTimeout(() => {
+          assistant.firstElementChild.textContent = 'Partial with more tokens';
+        }, 100);
+        if (mode === 'paused') return;
+        setTimeout(() => {
+          if (mode === 'extra-turn') message('user', 'A user interfered');
+          if (mode === 'replace-answer') {
+            assistant.remove();
+            completed(message('assistant', 'Replaced response'));
+            stop.remove();
+            send.disabled = false;
+            return;
+          }
+          assistant.firstElementChild.textContent =
+            'Final answer for: ' + prompt + '\n\n```python\nprint(42)\n```';
+          completed(assistant);
+          stop.remove();
+          send.disabled = false;
+          history.replaceState(null, '', '/c/mock-' + Date.now());
+          window.fixture.finished = Date.now();
+        }, 650);
+      };
+    </script>
+  </body>
+</html>

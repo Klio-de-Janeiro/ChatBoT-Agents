@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+  <meta charset="utf-8" /><title>MultiChat Agent</title
+  ><link rel="stylesheet" href="options.css" />
+  <main>
+    <h1>MultiChat Agent</h1>
+    <p>
+      Расширение использует текущий профиль Chrome. Сначала вручную войдите в нужный сервис и
+      оставьте его вкладку открытой. Для каждой роли будет создана отдельная неактивная вкладка.
+    </p>
+    <fieldset>
+      <legend>Разрешённые сервисы</legend>
+      <label><input id="deepseek" type="checkbox" /> DeepSeek — https://chat.deepseek.com</label
+      ><label><input id="qwen" type="checkbox" /> Qwen — https://chat.qwen.ai</label>
+    </fieldset>
+    <p>
+      Селекторы зависят от версии сайта. Если DOM не распознан, расширение остановится. Перед
+      изменением проверьте элементы в DevTools; CSS для роли assistant должен выбирать только ответ,
+      а complete — его явное состояние завершения.
+    </p>
+    <label for="config">Конфигурация провайдеров (JSON)</label
+    ><textarea id="config" spellcheck="false"></textarea>
+    <div>
+      <button id="save">Сохранить</button>
+      <button id="defaults">Вернуть селекторы по умолчанию</button>
+      <button id="refresh">Обновить диагностику</button>
+    </div>
+    <p id="message" role="status"></p>
+    <pre id="diagnostic"></pre>
+    <p>
+      Не повторяйте неизвестный запрос под новым ID до ручной проверки. Состояния запросов
+      сохраняются; удаление расширения или очистка его данных удаляет защиту от повторов.
+    </p>
+  </main>
+  <script src="options.js"></script>
+</html>
