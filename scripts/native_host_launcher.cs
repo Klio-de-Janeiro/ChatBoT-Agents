@@ -10,6 +10,18 @@ using System.Web.Script.Serialization;
 
 internal static class NativeHostLauncher
 {
+    private static void Pump(Stream source, Stream destination)
+    {
+        byte[] buffer = new byte[8192];
+        int count;
+        while ((count = source.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            destination.Write(buffer, 0, count);
+            // Native Messaging is interactive; never wait for EOF to flush a frame.
+            destination.Flush();
+        }
+    }
+
     private static int Main(string[] args)
     {
         Process child = null;
@@ -38,7 +50,7 @@ internal static class NativeHostLauncher
             Process running = child;
             // BaseStream preserves bytes: no text decoding, BOM, newline conversion or logging.
             Task input = Task.Factory.StartNew(delegate {
-                try { Console.OpenStandardInput().CopyTo(running.StandardInput.BaseStream); }
+                try { Pump(Console.OpenStandardInput(), running.StandardInput.BaseStream); }
                 catch (IOException) { }
                 catch (ObjectDisposedException) { }
                 finally { try { running.StandardInput.Close(); } catch (IOException) { } }
@@ -46,7 +58,7 @@ internal static class NativeHostLauncher
             Task output = Task.Factory.StartNew(delegate {
                 try {
                     Stream destination = Console.OpenStandardOutput();
-                    running.StandardOutput.BaseStream.CopyTo(destination);
+                    Pump(running.StandardOutput.BaseStream, destination);
                     destination.Flush();
                 } catch { try { running.Kill(); } catch { } throw; }
             }, TaskCreationOptions.LongRunning);
