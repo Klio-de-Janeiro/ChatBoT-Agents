@@ -148,7 +148,7 @@ def _doctor(store: Store) -> dict[str, Any]:
         integrity = db.execute("PRAGMA quick_check").fetchone()[0]
         hosts = db.execute("SELECT count(*) FROM hosts").fetchone()[0]
     return {
-        "status": "ok" if integrity == "ok" else "failed",
+        "status": ("failed" if integrity != "ok" else "ok" if hosts else "needs_user_action"),
         "version": __version__,
         "python": sys.version.split()[0],
         "python_executable": sys.executable,
@@ -157,6 +157,13 @@ def _doctor(store: Store) -> dict[str, Any]:
         "database_check": integrity,
         "native_host_name": "com.multichat.agent",
         "connected_hosts": hosts,
+        "browser_bridge_ready": bool(hosts),
+        "next_action": None
+        if hosts
+        else (
+            "Load extension/dist in Chrome, register native host with its actual extension ID, "
+            "then reload the extension. Opening provider tabs alone does not connect the CLI."
+        ),
         "live_provider_test": "not_performed",
         "queue_timeout_seconds": store.settings.queue_timeout,
     }

@@ -67,11 +67,24 @@ def test_relative_output_resolves_next_to_plan(monkeypatch, tmp_path, capsys, pl
 
 def test_doctor_checks_local_database_without_claiming_live_success(monkeypatch, tmp_path, capsys):
     setup_home(monkeypatch, tmp_path)
-    assert main(["doctor"]) == 0
+    assert main(["doctor"]) == 1
     result = json.loads(capsys.readouterr().out)
     assert result["database_check"] == "ok"
+    assert result["status"] == "needs_user_action"
+    assert result["browser_bridge_ready"] is False
+    assert result["next_action"]
     assert result["live_provider_test"] == "not_performed"
     assert Path(result["database_path"]).exists()
+
+
+def test_doctor_connected_bridge_does_not_claim_provider_success(monkeypatch, tmp_path, capsys):
+    setup_home(monkeypatch, tmp_path)
+    Store(Settings.from_env()).heartbeat("test-host")
+    assert main(["doctor"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["browser_bridge_ready"] is True
+    assert result["next_action"] is None
+    assert result["live_provider_test"] == "not_performed"
 
 
 def test_missing_task_is_structured_error(monkeypatch, tmp_path, capsys):
