@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "node node_modules/typescript/bin/tsc --noEmit && node scripts/build.mjs",
-    "test": "npm run build && node --import tsx --test tests/*.test.ts && node tests/browser.mjs",
+    "test": "npm run build && node --import tsx --test tests/*.test.ts && node tests/live-dom.mjs && node tests/browser.mjs",
     "test:unit": "node --import tsx --test tests/*.test.ts",
     "test:browser": "npm run build && node tests/browser.mjs",
     "inspect:providers": "node scripts/inspect-providers.mjs",

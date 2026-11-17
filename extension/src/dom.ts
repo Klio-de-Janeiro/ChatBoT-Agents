@@ -113,6 +113,15 @@ export class DomAdapter {
       partialText = '',
       observer: MutationObserver | undefined,
       timer: ReturnType<typeof setTimeout> | undefined;
+    const progress = {
+      revision: 'live-dom-2',
+      phase: 'prepare',
+      userSeen: false,
+      assistantSeen: false,
+      messageCount: 0,
+      complete: false,
+      generating: false,
+    };
     const pause = () =>
       new Promise<void>((resolve) => {
         let done = false;
@@ -181,13 +190,28 @@ export class DomAdapter {
           'Conversation changed before submission',
           'unknown',
         );
+      // The awaited storage barrier can let React replace the original button.
+      // Resolve the current control once, immediately before the only click.
+      send = this.first(this.config.selectors.send);
+      if (
+        !send ||
+        !send.isConnected ||
+        send.hasAttribute('disabled') ||
+        send.getAttribute('aria-disabled') === 'true'
+      )
+        throw new Diagnostic(
+          'SEND_CONTROL_CHANGED',
+          'Send control changed before click; no click performed',
+        );
       (send as HTMLElement).click();
+      progress.phase = 'await_user_echo';
       let lastText = '',
         stableSince = Date.now();
       while (Date.now() < deadline) {
         const d = this.diagnostic();
         if (d) throw d;
         const messages = this.messages();
+        progress.messageCount = messages.length;
         // Old messages cannot be used as new answers; history changes are ambiguous.
         if (baseline.some((e, i) => messages[i] !== e || this.text(e) !== baselineText[i]))
           throw new Diagnostic('HISTORY_CHANGED', 'Conversation history was replaced', 'unknown');
@@ -200,6 +224,8 @@ export class DomAdapter {
               'unknown',
             );
           user = fresh[0];
+          progress.userSeen = true;
+          progress.phase = 'await_assistant';
         }
         if (user) {
           if (!user.isConnected || this.text(user) !== normalize(job.prompt) || fresh[0] !== user)
@@ -212,6 +238,8 @@ export class DomAdapter {
             );
           if (!assistant && fresh[1]) assistant = fresh[1];
           if (assistant) {
+            progress.assistantSeen = true;
+            progress.phase = 'await_completion';
             if (fresh[1] !== assistant || !assistant.isConnected)
               throw new Diagnostic(
                 'ANSWER_CHANGED',
@@ -227,10 +255,12 @@ export class DomAdapter {
             const complete =
               this.config.selectors.complete.some((s) => assistant!.matches(s)) ||
               !!this.first(this.config.selectors.complete, assistant);
+            progress.complete = complete;
+            progress.generating = !!this.first(this.config.selectors.generating);
             if (
               text &&
               complete &&
-              !this.first(this.config.selectors.generating) &&
+              !progress.generating &&
               Date.now() - stableSince >= this.config.stable_ms
             ) {
               const response = result(job, 'completed', undefined, text, this.doc.location.href);
@@ -249,7 +279,14 @@ export class DomAdapter {
       return result(
         job,
         'timeout',
-        'DOM_TIMEOUT: No correlated completed assistant message before deadline',
+        'DOM_TIMEOUT: ' +
+          JSON.stringify({
+            ...progress,
+            documentVisibility: this.doc.visibilityState,
+            userMatches: this.doc.querySelectorAll(this.config.selectors.user.join(',')).length,
+            assistantMatches: this.doc.querySelectorAll(this.config.selectors.assistant.join(','))
+              .length,
+          }),
         partialText.slice(0, 500_000),
         this.doc.location.href,
       );
