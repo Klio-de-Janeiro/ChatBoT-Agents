@@ -23,3 +23,9 @@ The local mock models signed-in/account UI, textarea, historical user/assistant 
 The extension never reads cookies, copies profiles, changes login state, bypasses challenges or calls chatbot network APIs. Long responses can remain unknown if the tab/document or worker is lost; the extension deliberately does not retry them.
 
 Authenticated read-only inspection on 2026-11-17 confirmed that the initial selectors need revision: DeepSeek composer is a textarea with placeholder "Сообщение для DeepSeek" and no `chat-input` ID; Qwen uses `textarea.message-input-textarea` with placeholder "Спросить Qwen". DeepSeek controls include `div[role=button]`, often without accessible labels. No live send/completion controls have been validated. Do not treat adding the composer selectors alone as a working provider adapter. The CLI test could not reach either provider because no native host was registered/connected.
+
+## Subsequent authenticated UI tests
+
+After host registration and provider enablement, CLI reached the extension but existing tabs lacked its content script. Reloaded both pages after checking for empty drafts. Separate test conversations were submitted through the browser UI: DeepSeek returned a short response with the final action toolbar; Qwen returned a dual-response comparison card. These are UI tests, not successful end-to-end CLI tests.
+
+Updated selector defaults cover observed message roles, composer, submit controls, account evidence and completion markers. Stored legacy selector lists migrate only when unchanged; custom lists and enabled providers are preserved. Qwen dual-response cards produce a provider error requiring manual review, rather than silently selecting a response. The rebuilt extension must be reloaded in Chrome before an end-to-end CLI retest. Local verification: 13 unit tests and 13 mock-browser scenarios passed.

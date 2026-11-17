@@ -1,4 +1,10 @@
-import { DEFAULT_SETTINGS, parseSettings, type Settings, type ProviderConfig } from './config';
+import {
+  DEFAULT_SETTINGS,
+  migrateLegacySelectors,
+  parseSettings,
+  type Settings,
+  type ProviderConfig,
+} from './config';
 import { Diagnostic, isObject, originProvider, ORIGINS, type Job, type Result } from './protocol';
 import { type Store, type Platform, type Conversation } from './engine';
 
@@ -37,7 +43,10 @@ type Pending = {
 export class BrowserPlatform implements Platform {
   pending = new Map<string, Pending>();
   async settings(): Promise<Settings> {
-    return parseSettings((await store.get('settings')) ?? structuredClone(DEFAULT_SETTINGS));
+    const saved = parseSettings((await store.get('settings')) ?? structuredClone(DEFAULT_SETTINGS));
+    const updated = migrateLegacySelectors(saved);
+    if (JSON.stringify(saved) !== JSON.stringify(updated)) await store.set('settings', updated);
+    return updated;
   }
   async probe(tabId: number, config: ProviderConfig): Promise<Probe> {
     const p: unknown = await chrome.tabs.sendMessage(

@@ -16,7 +16,7 @@ export type Selectors = {
 export type ProviderConfig = { selectors: Selectors; stable_ms: number; poll_ms: number };
 export type Settings = { enabled: Provider[]; providers: Record<Provider, ProviderConfig> };
 // Conservative candidates. Site releases may require selector updates; no wildcard assistant fallback.
-export const DEFAULT_SETTINGS: Settings = {
+const LEGACY_SETTINGS: Settings = {
   enabled: [],
   providers: {
     deepseek: {
@@ -89,6 +89,54 @@ export const DEFAULT_SETTINGS: Settings = {
     },
   },
 };
+// Confirmed against the signed-in web interfaces, 2026-11-17.
+export const DEFAULT_SETTINGS: Settings = structuredClone(LEGACY_SETTINGS);
+const liveSelectors: Record<Provider, Partial<Selectors>> = {
+  deepseek: {
+    send: ['div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)'],
+    user: ['.ds-message.d29f3d7d'],
+    assistant: ['.ds-message:not(.d29f3d7d)'],
+    text: ['.ds-assistant-message-main-content', '.fbb737a4'],
+    generating: ['.ds-button--circle svg[data-icon="spin"]'],
+    complete: [
+      '.ds-message:has(.ds-assistant-message-main-content):has(+ .ds-flex [role="button"])',
+    ],
+    signedIn: ['a[href^="/a/chat/s/"]'],
+  },
+  qwen: {
+    composer: ['textarea.message-input-textarea'],
+    send: ['button.send-button:not(.disabled)'],
+    user: ['.qwen-chat-message-user'],
+    assistant: ['.qwen-chat-message-assistant'],
+    text: ['.user-message-content', '.response-message-content .qwen-markdown'],
+    complete: ['.qwen-chat-package-comp-new-action-control-container-copy'],
+    signedIn: ['button.user-menu-btn'],
+    error: ['.qwen-chat-message-dual-message'],
+  },
+};
+for (const provider of PROVIDERS) {
+  for (const field of Object.keys(liveSelectors[provider]) as (keyof Selectors)[]) {
+    DEFAULT_SETTINGS.providers[provider].selectors[field].push(...liveSelectors[provider][field]!);
+  }
+}
+
+export function migrateLegacySelectors(settings: Settings): Settings {
+  const updated = structuredClone(settings);
+  for (const provider of PROVIDERS) {
+    for (const field of Object.keys(liveSelectors[provider]) as (keyof Selectors)[]) {
+      if (
+        JSON.stringify(settings.providers[provider].selectors[field]) ===
+        JSON.stringify(LEGACY_SETTINGS.providers[provider].selectors[field])
+      ) {
+        updated.providers[provider].selectors[field] = [
+          ...DEFAULT_SETTINGS.providers[provider].selectors[field],
+        ];
+      }
+    }
+  }
+  return updated;
+}
+
 const selectorFields = Object.keys(DEFAULT_SETTINGS.providers.deepseek.selectors);
 function onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
