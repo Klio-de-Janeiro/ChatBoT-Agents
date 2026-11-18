@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MultiChat Agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minimum_chrome_version": "120",
   "description": "Native Messaging bridge for dedicated DeepSeek and Qwen chats.",
   "permissions": ["nativeMessaging", "storage", "unlimitedStorage", "tabs", "alarms"],

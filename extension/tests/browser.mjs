@@ -154,6 +154,14 @@ try {
             await page.evaluate(() => ({ started: fixture.started, finished: fixture.finished })),
           );
       assert.equal(generated.length, 2);
+      const workTabs = await worker.evaluate(async () =>
+        (await chrome.tabs.query({})).filter((tab) => tab.url?.includes('/c/mock-')),
+      );
+      assert.equal(new Set(workTabs.map((tab) => tab.windowId)).size, 2);
+      assert.ok(
+        workTabs.every((tab) => tab.active),
+        'each provider must have an active work tab',
+      );
       assert.ok(
         Math.max(...generated.map((x) => x.started)) <
           Math.min(...generated.map((x) => x.finished)),

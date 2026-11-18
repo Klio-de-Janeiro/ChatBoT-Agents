@@ -21,10 +21,12 @@ await build({
 });
 const browser = await chromium.launch({ headless: true });
 try {
-  for (const [provider, replaceButton] of [
+  for (const [provider, replaceButton, replaceMessage] of [
     ['deepseek', false],
     ['qwen', false],
     ['qwen', true],
+    ['deepseek', false, 'same'],
+    ['deepseek', false, 'different'],
   ]) {
     const page = await browser.newPage();
     await page.setContent(`
@@ -35,7 +37,7 @@ try {
     await page.addScriptTag({ path: 'work/live-adapter.js' });
     await page.addScriptTag({ path: 'work/live-config.js' });
     const result = await page.evaluate(
-      async ({ provider, replaceButton }) => {
+      async ({ provider, replaceButton, replaceMessage }) => {
         const config = structuredClone(Config.DEFAULT_SETTINGS.providers[provider]);
         config.stable_ms = 100;
         config.poll_ms = 25;
@@ -57,6 +59,25 @@ try {
             document.querySelector(
               provider === 'deepseek' ? '.fbb737a4' : '.user-message-content',
             ).textContent = prompt;
+            if (replaceMessage) {
+              const assistant = document.querySelector('.ds-message:not(.d29f3d7d)');
+              const row = document.createElement('div');
+              row.dataset.virtualListItemKey = '2';
+              assistant.before(row);
+              row.append(assistant);
+              document.querySelector('.ds-flex').remove();
+              assistant.querySelector('.ds-markdown').textContent = 'Partial answer';
+              setTimeout(() => {
+                const replacement = assistant.cloneNode(true);
+                replacement.querySelector('.ds-markdown').textContent = 'Final answer';
+                if (replaceMessage === 'different') row.dataset.virtualListItemKey = '3';
+                assistant.replaceWith(replacement);
+                row.insertAdjacentHTML(
+                  'beforeend',
+                  '<div class="ds-flex"><div role="button">Copy</div></div>',
+                );
+              }, 60);
+            }
           };
         };
         wireButton(document.querySelector('.send-button'));
@@ -78,16 +99,19 @@ try {
         });
         return { response, clicks };
       },
-      { provider, replaceButton },
+      { provider, replaceButton, replaceMessage },
     );
     assert.equal(
       result.response.status,
-      'completed',
-      JSON.stringify({ provider, replaceButton, ...result }),
+      replaceMessage === 'different' ? 'unknown' : 'completed',
+      JSON.stringify({ provider, replaceButton, replaceMessage, ...result }),
     );
     assert.equal(result.clicks, 1);
-    assert.equal(result.response.text, 'Final answer');
-    console.log(`PASS live DOM fixture: ${provider}, replaceButton=${replaceButton}`);
+    if (replaceMessage === 'different') assert.match(result.response.error, /ANSWER_CHANGED/);
+    else assert.equal(result.response.text, 'Final answer');
+    console.log(
+      `PASS live DOM fixture: ${provider}, replaceButton=${replaceButton}, replacement=${replaceMessage}`,
+    );
     await page.close();
   }
 } finally {

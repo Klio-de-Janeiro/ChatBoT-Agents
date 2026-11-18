@@ -77,6 +77,15 @@ export class DomAdapter {
   isUser(e: Element): boolean {
     return this.config.selectors.user.some((s) => e.matches(s));
   }
+  identity(e: Element): string | Element {
+    const row = e.closest('[data-virtual-list-item-key]');
+    const key = row?.getAttribute('data-virtual-list-item-key');
+    // DeepSeek reuses this row key when virtualized message nodes are replaced.
+    // Without a provider identity we retain strict DOM-node correlation.
+    return key !== null && key !== undefined
+      ? `${this.isUser(e) ? 'user' : 'assistant'}:${key}`
+      : e;
+  }
   value(e: Element): string {
     return e instanceof this.doc.defaultView!.HTMLTextAreaElement ||
       e instanceof this.doc.defaultView!.HTMLInputElement
@@ -114,7 +123,7 @@ export class DomAdapter {
       observer: MutationObserver | undefined,
       timer: ReturnType<typeof setTimeout> | undefined;
     const progress = {
-      revision: 'live-dom-2',
+      revision: 'live-dom-3',
       phase: 'prepare',
       userSeen: false,
       assistantSeen: false,
@@ -156,8 +165,11 @@ export class DomAdapter {
         throw new Diagnostic('USER_DRAFT', 'Dedicated tab contains an unsent draft');
       const baseline = this.messages();
       const baselineText = baseline.map((e) => this.text(e));
-      const baselineSet = new Set(baseline);
+      const baselineIds = baseline.map((e) => this.identity(e));
+      const baselineSet = new Set(baselineIds);
       let user: Element | undefined, assistant: Element | undefined;
+      let userIdentity: string | Element | undefined;
+      let assistantIdentity: string | Element | undefined;
       this.setValue(composer, job.prompt);
       if (normalize(this.value(composer)) !== normalize(job.prompt))
         throw new Diagnostic('COMPOSER_MISMATCH', 'Composer did not retain the exact prompt');
@@ -182,7 +194,9 @@ export class DomAdapter {
         throw new Diagnostic('DEADLINE', 'Deadline expired before click', 'timeout');
       if (
         this.messages().length !== baseline.length ||
-        this.messages().some((e, i) => e !== baseline[i] || this.text(e) !== baselineText[i]) ||
+        this.messages().some(
+          (e, i) => this.identity(e) !== baselineIds[i] || this.text(e) !== baselineText[i],
+        ) ||
         normalize(this.value(composer)) !== normalize(job.prompt)
       )
         throw new Diagnostic(
@@ -213,9 +227,18 @@ export class DomAdapter {
         const messages = this.messages();
         progress.messageCount = messages.length;
         // Old messages cannot be used as new answers; history changes are ambiguous.
-        if (baseline.some((e, i) => messages[i] !== e || this.text(e) !== baselineText[i]))
+        if (
+          baseline.some(
+            (_, i) =>
+              !messages[i] ||
+              this.identity(messages[i]!) !== baselineIds[i] ||
+              this.text(messages[i]!) !== baselineText[i],
+          )
+        )
           throw new Diagnostic('HISTORY_CHANGED', 'Conversation history was replaced', 'unknown');
-        const fresh = messages.filter((e) => !baselineSet.has(e));
+        if (new Set(messages.map((e) => this.identity(e))).size !== messages.length)
+          throw new Diagnostic('IDENTITY_COLLISION', 'Message identities are ambiguous', 'unknown');
+        const fresh = messages.filter((e) => !baselineSet.has(this.identity(e)));
         if (!user && fresh.length) {
           if (!this.isUser(fresh[0]!) || this.text(fresh[0]!) !== normalize(job.prompt))
             throw new Diagnostic(
@@ -224,28 +247,39 @@ export class DomAdapter {
               'unknown',
             );
           user = fresh[0];
+          userIdentity = this.identity(user!);
           progress.userSeen = true;
           progress.phase = 'await_assistant';
         }
         if (user) {
-          if (!user.isConnected || this.text(user) !== normalize(job.prompt) || fresh[0] !== user)
+          if (
+            !fresh[0] ||
+            this.identity(fresh[0]) !== userIdentity ||
+            this.text(fresh[0]) !== normalize(job.prompt)
+          )
             throw new Diagnostic('PROMPT_CHANGED', 'Captured prompt changed', 'unknown');
+          user = fresh[0];
           if (fresh.length > 2 || (fresh[1] && this.isUser(fresh[1])))
             throw new Diagnostic(
               'TAB_INTERFERENCE',
               'Unexpected extra turn in dedicated tab',
               'unknown',
             );
-          if (!assistant && fresh[1]) assistant = fresh[1];
+          if (!assistant && fresh[1]) {
+            assistant = fresh[1];
+            assistantIdentity = this.identity(assistant);
+          }
           if (assistant) {
             progress.assistantSeen = true;
             progress.phase = 'await_completion';
-            if (fresh[1] !== assistant || !assistant.isConnected)
+            if (!fresh[1] || this.identity(fresh[1]) !== assistantIdentity)
               throw new Diagnostic(
                 'ANSWER_CHANGED',
                 'Captured assistant message was replaced',
                 'unknown',
               );
+            if (fresh[1] !== assistant) stableSince = Date.now();
+            assistant = fresh[1];
             const text = this.text(assistant);
             partialText = text;
             if (text !== lastText) {

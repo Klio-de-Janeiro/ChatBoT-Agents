@@ -124,13 +124,22 @@ export class BrowserPlatform implements Platform {
         errors[0] ??
           'No tab has positive signed-in DOM evidence; check login and provider selectors',
       );
-    const created = await chrome.tabs.create({
+    // Each conversation has an active tab in an owned window. Real providers may
+    // defer rendering and event handling in inactive tabs; separate windows also
+    // preserve parallelism without changing the user's existing active tabs.
+    const workspace = await chrome.windows.create({
       url: `${ORIGINS[job.provider]}/`,
-      active: false,
-      windowId: signedIn.windowId,
+      type: 'normal',
+      focused: true,
+      width: 900,
+      height: 750,
+      left: job.provider === 'deepseek' ? 20 : 460,
+      top: 40,
     });
-    if (created.id === undefined)
+    const created = workspace?.tabs?.[0];
+    if (!created || created.id === undefined || workspace?.id === undefined)
       throw new Diagnostic('TAB_CREATE_FAILED', 'Chrome did not create a dedicated tab', 'failed');
+    await chrome.storage.session.set({ [`work-window:${workspace.id}`]: true });
     const id = created.id,
       token = crypto.randomUUID();
     // Ownership is ephemeral across browser restarts, and durable across worker restarts.
@@ -139,7 +148,7 @@ export class BrowserPlatform implements Platform {
     let last = 'DOM_UNSUPPORTED: New tab did not become ready';
     while (Date.now() < until) {
       const tab = await chrome.tabs.get(id);
-      if (tab.url && originProvider(tab.url) !== job.provider)
+      if (tab.url && tab.url !== 'about:blank' && originProvider(tab.url) !== job.provider)
         throw new Diagnostic(
           'TAB_REDIRECTED',
           'New tab redirected outside the allowlisted provider origin',
@@ -206,6 +215,19 @@ export class BrowserPlatform implements Platform {
     conversation: Conversation,
     authorize: () => Promise<void>,
   ): Promise<Result> {
+    const tab = await chrome.tabs.get(conversation.tabId);
+    const owned = (await chrome.storage.session.get(`work-window:${tab.windowId}`))[
+      `work-window:${tab.windowId}`
+    ];
+    if (!owned)
+      throw new Diagnostic('WORKSPACE_REQUIRED', 'Use a new conversation in an owned work window');
+    const window = await chrome.windows.get(tab.windowId);
+    if (window.state === 'minimized')
+      throw new Diagnostic(
+        'WORKSPACE_MINIMIZED',
+        'Restore the work window before running a new job',
+      );
+    if (!tab.active) await chrome.tabs.update(conversation.tabId, { active: true });
     const config = settings.providers[job.provider],
       probe = await this.probe(conversation.tabId, config);
     if (probe.url !== conversation.url)
