@@ -70,6 +70,14 @@ V2_COLUMNS = {
 
 V3_COLUMNS = {"jobs": {"chat_url": "TEXT"}, "commands": {"chat_url": "TEXT"}}
 
+# Additive migration: provider-native Markdown copies next to raw .txt bodies.
+# `commands.markdown_path` points at responses/<job>.md, while
+# `tasks.output_markdown_path` points at the published Markdown answer.
+V4_COLUMNS = {
+    "commands": {"markdown_path": "TEXT"},
+    "tasks": {"output_markdown_path": "TEXT"},
+}
+
 
 def _wire_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # The v1 extension rejects unknown fields. Preserve its exact request shape for
@@ -108,12 +116,12 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             try:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1, 2, 3):
+                if version not in (0, 1, 2, 3, 4):
                     raise AgentError("unsupported_schema", "unsupported database schema version")
                 for statement in SCHEMA.split(";"):
                     if statement.strip():
                         db.execute(statement)
-                for target, changes in ((2, V2_COLUMNS), (3, V3_COLUMNS)):
+                for target, changes in ((2, V2_COLUMNS), (3, V3_COLUMNS), (4, V4_COLUMNS)):
                     if version >= target:
                         continue
                     for table, columns in changes.items():
@@ -203,8 +211,9 @@ class Store:
     def jobs(self, task_id: str) -> dict[str, dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                "SELECT j.*,c.metadata_path,c.conversation_url FROM jobs j LEFT JOIN commands c "
-                "ON j.request_id=c.request_id WHERE j.task_id=? ORDER BY j.rowid",
+                "SELECT j.*,c.metadata_path,c.conversation_url,c.markdown_path FROM jobs j "
+                "LEFT JOIN commands c ON j.request_id=c.request_id "
+                "WHERE j.task_id=? ORDER BY j.rowid",
                 (task_id,),
             )
             jobs = {}
@@ -230,6 +239,7 @@ class Store:
                     "status",
                     "request_id",
                     "result_path",
+                    "markdown_path",
                     "metadata_path",
                     "conversation_url",
                     "error",
@@ -242,6 +252,8 @@ class Store:
             "status": task["status"],
             "error": task["error"],
             "output_path": task["output_path"],
+            # Published provider-native Markdown copy (answers only, None until done).
+            "output_markdown_path": task["output_markdown_path"],
             "task_dir": str(self.task_dir(task_id)),
             "jobs": job_summaries,
             "diagnostic": next(
@@ -275,12 +287,19 @@ class Store:
             )
 
     def set_task(
-        self, task_id: str, status: str, *, error: str | None = None, output_path: str | None = None
+        self,
+        task_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        output_path: str | None = None,
+        markdown_path: str | None = None,
     ) -> None:
         with self.connect(transaction=True) as db:
             db.execute(
-                "UPDATE tasks SET status=?,error=?,output_path=?,updated=? WHERE task_id=?",
-                (status, error, output_path, time.time(), task_id),
+                "UPDATE tasks SET status=?,error=?,output_path=?,updated=?,"
+                "output_markdown_path=COALESCE(?,output_markdown_path) WHERE task_id=?",
+                (status, error, output_path, time.time(), markdown_path, task_id),
             )
 
     def add_editor(self, task_id: str, plan: Plan, *, repair: bool = False) -> str:
@@ -447,11 +466,28 @@ class Store:
                     status, error = "unknown", "provider_chat_url_changed"
             directory = self.task_dir(row["task_id"]) / "responses"
             raw = None
+            markdown = None
+            content = None
             if row["operation"] != "open":
                 raw = directory / f"{row['job_id']}.txt"
                 atomic_text(raw, result.text)
+                # Lossless capture: exactly what the provider would copy (tables,
+                # code fences, formulas) plus a structured tree for future rich
+                # consumers such as copied images or speech. The plain `.txt`
+                # above remains the compatibility contract, so a missing or empty
+                # Markdown capture falls back to the stored text.
+                if result.markdown is not None and result.markdown.strip():
+                    markdown = directory / f"{row['job_id']}.md"
+                    atomic_text(markdown, result.markdown)
+                if result.content is not None:
+                    content = directory / f"{row['job_id']}.content.json"
+                    atomic_text(
+                        content,
+                        result.content.model_dump_json(indent=1, exclude_none=True) + "\n",
+                    )
             metadata = directory / f"{row['job_id']}.result.json"
-            receipt = result.model_dump(exclude={"text"})
+            # Receipts stay body-free; only file paths and capture sizes are added.
+            receipt = result.model_dump(exclude={"text", "markdown", "content"})
             receipt.update(
                 {
                     "operation": row["operation"],
@@ -460,12 +496,18 @@ class Store:
                     "accepted_status": status,
                     "accepted_error": error,
                     "trusted_conversation_url": url,
+                    "markdown_path": str(markdown) if markdown is not None else None,
+                    "markdown_bytes": (
+                        len(result.markdown.encode("utf-8")) if markdown is not None else 0
+                    ),
+                    "content_path": str(content) if content is not None else None,
+                    "content_blocks": len(result.content.blocks) if content is not None else 0,
                 }
             )
             atomic_text(metadata, json.dumps(receipt, ensure_ascii=False))
             db.execute(
-                "UPDATE commands SET conversation_url=? WHERE request_id=?",
-                (url, result.request_id),
+                "UPDATE commands SET conversation_url=?,markdown_path=? WHERE request_id=?",
+                (url, str(markdown) if markdown is not None else None, result.request_id),
             )
             self._finish(
                 db,

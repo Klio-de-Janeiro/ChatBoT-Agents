@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from . import __version__
+from .clipboard import copy_text
 from .config import Settings
 from .errors import AgentError
 from .models import OPEN_PROMPT, OUTPUT_EXTENSIONS, JobPlan, OutputPlan, Plan
@@ -53,7 +54,9 @@ def positive_seconds(raw: str) -> float:
 def parser() -> JsonParser:
     result = JsonParser(prog="mca", description="Durable local browser chat orchestration")
     commands = result.add_subparsers(
-        dest="command", required=True, metavar="{run,ask,open,providers,status,doctor,native-host}"
+        dest="command",
+        required=True,
+        metavar="{run,ask,open,copy,providers,status,doctor,native-host}",
     )
     run = commands.add_parser("run", help="enqueue a JSON plan; resume an identical task safely")
     run.add_argument("plan", type=Path)
@@ -86,6 +89,15 @@ def parser() -> JsonParser:
             type=positive_seconds,
             help="bound this CLI wait; does not cancel the task",
         )
+    copy = commands.add_parser(
+        "copy", help="copy the answer to the clipboard exactly as the provider formatted it"
+    )
+    copy.add_argument("task_id")
+    copy.add_argument(
+        "--raw",
+        action="store_true",
+        help="copy the plain saved text instead of the provider-native Markdown",
+    )
     status = commands.add_parser("status", help="report or resume a persisted task")
     status.add_argument("task_id")
     status.add_argument("--wait", action="store_true")
@@ -187,6 +199,33 @@ def _doctor(store: Store) -> dict[str, Any]:
     }
 
 
+def _copy(store: Store, task_id: str, raw: bool) -> dict[str, Any]:
+    """Put one answer on the clipboard without printing or re-encoding it."""
+    task = store.task(task_id)
+    if task["status"] != "completed":
+        raise AgentError("task_not_completed", "only a completed task has an answer to copy")
+    jobs = store.jobs(task_id)
+    job = next((item for item in jobs.values() if item["role"] == "author"), None)
+    if job is None or job["operation"] == "open":
+        raise AgentError("no_answer_to_copy", "this task opened a conversation; it has no answer")
+    # Results received before 0.3.0 have only the plain `.txt` body.
+    markdown = None if raw else job["markdown_path"]
+    source = markdown or job["result_path"]
+    if not source or not Path(source).is_file():
+        raise AgentError("response_missing", "the saved answer file is missing")
+    text = Path(source).read_text(encoding="utf-8")
+    utility = copy_text(text)
+    return {
+        "status": "ok",
+        "task_id": task_id,
+        "job_id": job["job_id"],
+        "format": "markdown" if markdown else "text",
+        "source_path": source,
+        "characters": len(text),
+        "clipboard": utility,
+    }
+
+
 def direct_output(args: argparse.Namespace, task_dir: Path) -> OutputPlan:
     # Retain the original plan defaults so old task IDs can still be resumed.
     if args.command == "open" or (args.format is None and args.output is None):
@@ -233,6 +272,10 @@ def main(argv: list[str] | None = None) -> int:
             summary = _doctor(store)
         elif args.command == "_worker":
             asyncio.run(Scheduler(store).run(args.task_id))
+            return 0
+        elif args.command == "copy":
+            store.expire()
+            emit(_copy(store, args.task_id, args.raw))
             return 0
         elif args.command == "status":
             if args.wait:

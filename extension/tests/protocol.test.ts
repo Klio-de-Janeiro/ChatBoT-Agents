@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseJob, originProvider, validResult, result, MAX_PROMPT_BYTES } from '../src/protocol';
+import {
+  parseJob,
+  originProvider,
+  validResult,
+  result,
+  MAX_PROMPT_BYTES,
+  MAX_MARKDOWN_BYTES,
+} from '../src/protocol';
 import { parseSettings, DEFAULT_SETTINGS } from '../src/config';
 const job = {
   type: 'job' as const,
@@ -83,6 +90,35 @@ test('result correlation and response bounds are validated', () => {
     { error: 3 },
   ])
     assert.equal(validResult({ ...r, ...patch }, job), false);
+});
+test('rich answer capture travels next to text and is bounded', () => {
+  const capture = {
+    markdown: '## Title\n\n| a | b |\n| --- | --- |\n| 1 | 2 |',
+    content: { version: 1, plain: 'Title', blocks: [{ type: 'heading', text: 'Title' }] },
+  };
+  const rich = result(job, 'completed', undefined, 'Title', 'https://chat.qwen.ai/c/1', capture);
+  assert.deepEqual(rich.markdown, capture.markdown);
+  assert.deepEqual(rich.content, capture.content);
+  assert.equal(validResult(rich, job), true);
+  // Both fields are optional: an old-style result still validates.
+  const plainResult = result(job, 'completed', undefined, 'Title', 'https://chat.qwen.ai/c/1');
+  assert.equal('markdown' in plainResult, false);
+  assert.equal(validResult(plainResult, job), true);
+  for (const patch of [
+    { markdown: 42 },
+    { markdown: 'a'.repeat(MAX_MARKDOWN_BYTES + 1) },
+    { content: 'blocks' },
+    { content: ['blocks'] },
+    { content: { blocks: 'not-an-array' } },
+  ])
+    assert.equal(validResult({ ...rich, ...patch }, job), false);
+  // Empty captures are dropped rather than sent as meaningless fields.
+  const empty = result(job, 'completed', undefined, 'Title', 'https://chat.qwen.ai/c/1', {
+    markdown: '',
+    content: undefined,
+  });
+  assert.equal('markdown' in empty, false);
+  assert.equal('content' in empty, false);
 });
 test('settings have explicit opt-in and cannot redefine origins or code', () => {
   assert.deepEqual(parseSettings(DEFAULT_SETTINGS).enabled, []);

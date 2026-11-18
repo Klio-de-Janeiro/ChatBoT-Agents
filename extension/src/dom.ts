@@ -11,6 +11,7 @@ import {
 } from './protocol';
 import type { ProviderConfig } from './config';
 import { applyRequestedModes } from './modes';
+import { richAnswer, type RichAnswer } from './answers';
 
 export const normalize = (s: string) =>
   s
@@ -91,6 +92,16 @@ export class DomAdapter {
             : undefined),
       url: this.doc.location.href,
     };
+  }
+  // Capture the answer as the provider itself would copy it. Attachment is not
+  // a gate: `markdown`/`content` are additive to the plain-text contract and
+  // the answer is never failed only because a rich copy could not be taken.
+  private capture(answer: Element, text: string): RichAnswer | undefined {
+    try {
+      return richAnswer(answer, text);
+    } catch {
+      return undefined;
+    }
   }
   // A provider may show a reply before updating its history or redirecting.
   private hasSavedThread(provider: Job['provider']): boolean {
@@ -425,7 +436,14 @@ export class DomAdapter {
               !progress.generating &&
               Date.now() - stableSince >= this.config.stable_ms
             ) {
-              const response = result(job, 'completed', undefined, text, this.doc.location.href);
+              const response = result(
+                job,
+                'completed',
+                undefined,
+                text,
+                this.doc.location.href,
+                this.capture(assistant, text),
+              );
               if (utf8Bytes(JSON.stringify(response)) > MAX_RESULT_BYTES)
                 throw new Diagnostic(
                   'ANSWER_TOO_LARGE',
@@ -451,6 +469,7 @@ export class DomAdapter {
           }),
         partialText.slice(0, 500_000),
         this.doc.location.href,
+        assistant ? this.capture(assistant, partialText.slice(0, 500_000)) : undefined,
       );
     } catch (error) {
       const d =

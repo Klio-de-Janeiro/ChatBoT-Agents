@@ -213,8 +213,17 @@
             send.disabled = false;
             return;
           }
-          assistant.firstElementChild.textContent =
-            'Final answer for: ' + prompt + '\n\n```python\nprint(42)\n```';
+          // Rich provider-like answer: heading, emphasis, math, table, code.
+          assistant.firstElementChild.innerHTML =
+            '<h3>Answer for <em>' +
+            prompt.replace(/&/g, '&amp;').replace(/</g, '&lt;') +
+            '</em></h3>' +
+            '<p>Energy: <span class="katex"><span class="katex-mathml">' +
+            '<math><annotation encoding="application/x-tex">E = mc^2</annotation></math>' +
+            '</span><span class="katex-html">E=mc²</span></span> keeps working.</p>' +
+            '<table><thead><tr><th>a</th><th>b</th></tr></thead>' +
+            '<tbody><tr><td>1</td><td>2</td></tr></tbody></table>' +
+            '<pre class="language-python"><code class="language-python">print(42)</code></pre>';
           completed(assistant);
           stop.remove();
           send.disabled = false;

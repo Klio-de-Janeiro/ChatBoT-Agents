@@ -148,9 +148,19 @@ try {
       const [a, b] = await Promise.all([response(deepseek), response(qwen)]);
       assert.equal(a.status, 'completed', JSON.stringify(a));
       assert.equal(b.status, 'completed', JSON.stringify(b));
-      assert.equal(
-        a.text,
-        'Final answer for: ' + deepseek.prompt + '\n\n```python\nprint(42)\n```',
+      // Plain text stays the compatibility contract (innerText of the mock DOM).
+      assert.match(a.text, new RegExp('^Answer for ' + deepseek.prompt));
+      assert.match(a.text, /E=mc² keeps working\./);
+      assert.match(a.text, /\nprint\(42\)$/);
+      // ...and the provider-native capture travels next to it.
+      assert.match(a.markdown, new RegExp('^### Answer for \\*' + deepseek.prompt + '\\*$', 'm'));
+      assert.match(a.markdown, /Energy: \$E = mc\^2\$ keeps working\./);
+      assert.match(a.markdown, /\| a \| b \|\n\| --- \| --- \|\n\| 1 \| 2 \|/);
+      assert.match(a.markdown, /```python\nprint\(42\)\n```/);
+      assert.equal(a.content.version, 1);
+      assert.deepEqual(
+        a.content.blocks.map((block) => block.type),
+        ['heading', 'paragraph', 'table', 'code'],
       );
       assert.match(a.conversation_url, /\/c\/mock-/);
       assert.equal(await signed.deepseek.evaluate(() => fixture.clicks), 0);

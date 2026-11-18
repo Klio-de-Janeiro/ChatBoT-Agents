@@ -78,6 +78,23 @@ def write_answer(text: str, path: Path, output_format: OutputFormat) -> None:
     write_artifact(document, path, output_format)
 
 
+def markdown_answer(text: str, path: Path, output_format: OutputFormat) -> None:
+    """Publish an answer as Markdown verbatim, without wrapping it in cells.
+
+    The provider already returned Markdown in its own dialect (tables, task
+    lists, formulas); re-serializing it through `write_answer` would add a
+    code fence or escape structure. `path` always carries a `.md` extension.
+    """
+    if output_format not in {"md", "markdown"}:
+        raise ValueError("verbatim Markdown requires the md/markdown format")
+    atomic_text(path, text if text.endswith("\n") else text + "\n")
+
+
+def copy_markdown(source: Path, destination: Path) -> None:
+    """Store a provider-native Markdown copy without reinterpreting its bytes."""
+    atomic_text(destination, source.read_text(encoding="utf-8"))
+
+
 def author_document(outputs: list[tuple[str, str]]) -> CellDocument:
     """Without an editor, retain author prose as markdown, never guess code boundaries."""
     return CellDocument(

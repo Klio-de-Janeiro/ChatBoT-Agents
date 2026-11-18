@@ -119,7 +119,7 @@ def test_migration_preserves_old_tasks_jobs_results_and_send_counts(legacy):
         }
     store = Store(settings)
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         for table, rows in original.items():
             upgraded = db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
             assert [tuple(row)[: len(rows[0])] for row in upgraded] == rows
@@ -162,7 +162,7 @@ def test_concurrent_migration_is_atomic_and_idempotent(legacy):
     with ThreadPoolExecutor(max_workers=8) as pool:
         stores = list(pool.map(lambda _: Store(settings), range(8)))
     with stores[0].connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert db.execute("SELECT count(*) FROM commands").fetchone()[0] == 3
         assert db.execute("SELECT sum(send_count) FROM commands").fetchone()[0] == 2
 
