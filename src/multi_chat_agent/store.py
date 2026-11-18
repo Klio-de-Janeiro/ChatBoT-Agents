@@ -17,9 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .diagnostics import receipt_diagnostic
 from .errors import AgentError
 from .files import atomic_text
-from .models import TERMINAL, NativeResult, Plan
+from .models import OPEN_PROMPT, TERMINAL, NativeResult, Plan, TaskKind
+from .providers import saved_chat_url, trusted_url
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -50,8 +52,35 @@ CREATE TABLE IF NOT EXISTS commands (
 CREATE INDEX IF NOT EXISTS commands_pending ON commands(state,created);
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_casefold ON tasks(task_id COLLATE NOCASE);
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_casefold ON jobs(task_id,job_id COLLATE NOCASE);
-PRAGMA user_version=1;
 """
+
+# Additive migration: completed/uncertain commands and their send_count remain intact.
+V2_COLUMNS = {
+    "jobs": {
+        "operation": "TEXT NOT NULL DEFAULT 'ask'",
+        "modes_json": "TEXT NOT NULL DEFAULT '{}'",
+    },
+    "commands": {
+        "operation": "TEXT NOT NULL DEFAULT 'ask'",
+        "modes_json": "TEXT NOT NULL DEFAULT '{}'",
+        "conversation_url": "TEXT",
+    },
+}
+
+
+V3_COLUMNS = {"jobs": {"chat_url": "TEXT"}, "commands": {"chat_url": "TEXT"}}
+
+
+def _wire_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # The v1 extension rejects unknown fields. Preserve its exact request shape for
+    # ordinary asks, while keeping operation/modes durable in the v2 journal.
+    wire = payload.copy()
+    if not wire["chat_url"]:
+        del wire["chat_url"]
+    if wire["operation"] == "ask" and not wire["modes"]:
+        del wire["operation"]
+        del wire["modes"]
+    return wire
 
 
 class Store:
@@ -59,11 +88,44 @@ class Store:
         self.settings = settings
         settings.home.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
-                raise AgentError("unsupported_schema", "unsupported database schema version")
-            db.executescript(SCHEMA)
+            # SQLite versions shipped with Python 3.11 may return BUSY immediately
+            # during concurrent WAL transitions, ignoring the normal busy timeout.
+            # Retrying this initialization is safe: no command has been claimed.
+            wal_deadline = time.monotonic() + 5
+            while True:
+                try:
+                    db.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as error:
+                    code = getattr(error, "sqlite_errorcode", 0) & 255
+                    if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} or (
+                        time.monotonic() >= wal_deadline
+                    ):
+                        raise
+                    time.sleep(0.02)
+            # executescript commits implicitly; execute static DDL statements separately
+            # so both bootstrap and migration are atomic across concurrent host startups.
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (0, 1, 2, 3):
+                    raise AgentError("unsupported_schema", "unsupported database schema version")
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+                for target, changes in ((2, V2_COLUMNS), (3, V3_COLUMNS)):
+                    if version >= target:
+                        continue
+                    for table, columns in changes.items():
+                        existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+                        for name, definition in columns.items():
+                            if name not in existing:
+                                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                    db.execute(f"PRAGMA user_version={target}")
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
 
     @contextmanager
     def connect(self, *, transaction: bool = False) -> Iterator[sqlite3.Connection]:
@@ -87,7 +149,11 @@ class Store:
     def task_dir(self, task_id: str) -> Path:
         return self.settings.home / "tasks" / task_id
 
-    def submit(self, plan: Plan, *, kind: str = "plan") -> bool:
+    def submit(self, plan: Plan, *, kind: TaskKind = "plan") -> bool:
+        if kind in {"ask", "open"} and (
+            len(plan.jobs) != 1 or plan.editor is not None or plan.jobs[0].operation != kind
+        ):
+            raise AgentError("invalid_direct_task", "direct tasks require one matching operation")
         serialized = plan.model_dump_json()
         now = time.time()
         with self.connect(transaction=True) as db:
@@ -95,7 +161,12 @@ class Store:
                 "SELECT plan_json,kind FROM tasks WHERE task_id=? COLLATE NOCASE", (plan.task_id,)
             ).fetchone()
             if previous:
-                if previous["plan_json"] != serialized or previous["kind"] != kind:
+                # Older plans omit defaults added in v2. Compare validated meaning,
+                # not their JSON spelling, to preserve idempotent resume after upgrade.
+                if (
+                    Plan.model_validate_json(previous["plan_json"]) != plan
+                    or previous["kind"] != kind
+                ):
                     raise AgentError(
                         "task_conflict", "task_id already exists with a different plan"
                     )
@@ -106,8 +177,18 @@ class Store:
             )
             for job in plan.jobs:
                 db.execute(
-                    "INSERT INTO jobs(task_id,job_id,role,provider,timeout) VALUES(?,?,?,?,?)",
-                    (plan.task_id, job.id, "author", job.provider, job.timeout),
+                    "INSERT INTO jobs(task_id,job_id,role,provider,timeout,"
+                    "operation,modes_json,chat_url) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        plan.task_id,
+                        job.id,
+                        "author",
+                        job.provider,
+                        job.timeout,
+                        job.operation,
+                        json.dumps(job.modes, ensure_ascii=False),
+                        job.chat_url,
+                    ),
                 )
         atomic_text(self.task_dir(plan.task_id) / "plan.json", serialized)
         return True
@@ -122,37 +203,59 @@ class Store:
     def jobs(self, task_id: str) -> dict[str, dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
-                "SELECT j.*,c.metadata_path FROM jobs j LEFT JOIN commands c "
+                "SELECT j.*,c.metadata_path,c.conversation_url FROM jobs j LEFT JOIN commands c "
                 "ON j.request_id=c.request_id WHERE j.task_id=? ORDER BY j.rowid",
                 (task_id,),
             )
-            return {row["job_id"]: dict(row) for row in rows}
+            jobs = {}
+            for row in rows:
+                job = dict(row)
+                job["modes"] = json.loads(job.pop("modes_json"))
+                jobs[row["job_id"]] = job
+            return jobs
 
     def summary(self, task_id: str) -> dict[str, Any]:
         task = self.task(task_id)
-        return {
+        jobs = self.jobs(task_id)
+        job_summaries = []
+        for job in jobs.values():
+            item = {
+                key: job[key]
+                for key in (
+                    "job_id",
+                    "role",
+                    "provider",
+                    "operation",
+                    "modes",
+                    "status",
+                    "request_id",
+                    "result_path",
+                    "metadata_path",
+                    "conversation_url",
+                    "error",
+                )
+            }
+            item["diagnostic"] = receipt_diagnostic(job["metadata_path"])
+            job_summaries.append(item)
+        summary = {
             "task_id": task_id,
             "status": task["status"],
             "error": task["error"],
             "output_path": task["output_path"],
             "task_dir": str(self.task_dir(task_id)),
-            "jobs": [
-                {
-                    key: job[key]
-                    for key in (
-                        "job_id",
-                        "role",
-                        "provider",
-                        "status",
-                        "request_id",
-                        "result_path",
-                        "metadata_path",
-                        "error",
-                    )
-                }
-                for job in self.jobs(task_id).values()
-            ],
+            "jobs": job_summaries,
+            "diagnostic": next(
+                (
+                    job["diagnostic"]
+                    for job in job_summaries
+                    if job["status"] != "completed" and job["diagnostic"]
+                ),
+                None,
+            ),
         }
+        if task["kind"] == "open":
+            summary["conversation_url"] = next(iter(jobs.values()))["conversation_url"]
+        return summary
 
     def acquire_runner(self, task_id: str, owner: str) -> bool:
         now = time.time()
@@ -185,27 +288,31 @@ class Store:
         job_id = "_repair" if repair else "_editor"
         with self.connect(transaction=True) as db:
             db.execute(
-                "INSERT OR IGNORE INTO jobs(task_id,job_id,role,provider,timeout) "
-                "VALUES(?,?,?,?,?)",
+                "INSERT OR IGNORE INTO jobs(task_id,job_id,role,provider,timeout,"
+                "modes_json,chat_url) VALUES(?,?,?,?,?,?,?)",
                 (
                     task_id,
                     job_id,
                     "repair" if repair else "editor",
                     plan.editor.provider,
                     plan.editor.timeout,
+                    json.dumps(plan.editor.modes, ensure_ascii=False),
+                    plan.editor.chat_url,
                 ),
             )
         return job_id
 
     def enqueue(self, task_id: str, job_id: str, prompt: str) -> str | None:
-        if len(prompt.encode("utf-8")) > self.settings.max_prompt_bytes:
-            raise AgentError("prompt_too_large", "prompt exceeds configured size limit")
         with self.connect(transaction=True) as db:
             job = db.execute(
                 "SELECT * FROM jobs WHERE task_id=? AND job_id=?", (task_id, job_id)
             ).fetchone()
             if job is None or job["status"] != "pending":
                 return None
+            # Even a plan containing demo/user text must not send that text for open.
+            prompt = OPEN_PROMPT if job["operation"] == "open" else prompt
+            if len(prompt.encode("utf-8")) > self.settings.max_prompt_bytes:
+                raise AgentError("prompt_too_large", "prompt exceeds configured size limit")
             request_id = str(uuid.uuid4())
             role = "editor" if job["role"] == "repair" else job["role"]
             conversation_key = f"{task_id}:{job['provider']}:{role}"
@@ -217,8 +324,16 @@ class Store:
                 "prompt": prompt,
                 "conversation_key": conversation_key,
                 "timeout_ms": timeout_ms,
+                "operation": job["operation"],
+                "modes": json.loads(job["modes_json"]),
+                "chat_url": job["chat_url"],
             }
-            if len(json.dumps(wire, ensure_ascii=False).encode("utf-8")) > (
+            pending_state = "pending"
+            if wire["chat_url"]:
+                pending_state = "pending_v3"
+            elif wire["operation"] != "ask" or wire["modes"]:
+                pending_state = "pending_v2"
+            if len(json.dumps(_wire_payload(wire), ensure_ascii=False).encode("utf-8")) > (
                 self.settings.max_outbound_bytes
             ):
                 raise AgentError(
@@ -226,7 +341,8 @@ class Store:
                 )
             db.execute(
                 "INSERT INTO commands(request_id,task_id,job_id,provider,prompt,conversation_key,"
-                "timeout_ms,created) VALUES(?,?,?,?,?,?,?,?)",
+                "timeout_ms,created,operation,modes_json,state,chat_url) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     request_id,
                     task_id,
@@ -236,6 +352,12 @@ class Store:
                     conversation_key,
                     timeout_ms,
                     time.time(),
+                    job["operation"],
+                    job["modes_json"],
+                    # A pre-upgrade native-host still running in memory only claims
+                    # state='pending'. Never let it mistake an open sentinel for an ask.
+                    pending_state,
+                    job["chat_url"],
                 ),
             )
             db.execute(
@@ -257,13 +379,14 @@ class Store:
         now = time.time()
         with self.connect(transaction=True) as db:
             row = db.execute(
-                "SELECT * FROM commands WHERE state='pending' ORDER BY created LIMIT 1"
+                "SELECT * FROM commands WHERE state IN ('pending','pending_v2','pending_v3') "
+                "ORDER BY created LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
             db.execute(
                 "UPDATE commands SET state='sent',owner=?,sent_at=?,deadline=?,send_count=1 "
-                "WHERE request_id=? AND state='pending'",
+                "WHERE request_id=? AND state IN ('pending','pending_v2','pending_v3')",
                 (
                     owner,
                     now,
@@ -272,14 +395,19 @@ class Store:
                 ),
             )
             db.execute("UPDATE jobs SET status='running' WHERE request_id=?", (row["request_id"],))
-            return {
-                "type": "job",
-                "request_id": row["request_id"],
-                "provider": row["provider"],
-                "prompt": row["prompt"],
-                "conversation_key": row["conversation_key"],
-                "timeout_ms": row["timeout_ms"],
-            }
+            return _wire_payload(
+                {
+                    "type": "job",
+                    "request_id": row["request_id"],
+                    "provider": row["provider"],
+                    "prompt": row["prompt"],
+                    "conversation_key": row["conversation_key"],
+                    "timeout_ms": row["timeout_ms"],
+                    "operation": row["operation"],
+                    "modes": json.loads(row["modes_json"]),
+                    "chat_url": row["chat_url"],
+                }
+            )
 
     @staticmethod
     def _finish(
@@ -307,13 +435,46 @@ class Store:
             ).fetchone()
             if row is None:
                 return False
+            url = trusted_url(row["provider"], result.conversation_url)
+            status = result.status
+            error = None if status == "completed" else f"provider_{status}"
+            if status == "completed" and row["operation"] == "ask" and not result.text.strip():
+                status, error = "failed", "provider_empty_response"
+            if status == "completed" and row["operation"] == "open" and url is None:
+                status, error = "needs_user_action", "provider_invalid_conversation_url"
+            if result.status == "completed" and row["chat_url"]:
+                if not url or saved_chat_url(row["provider"], url) != row["chat_url"]:
+                    status, error = "unknown", "provider_chat_url_changed"
             directory = self.task_dir(row["task_id"]) / "responses"
-            raw = directory / f"{row['job_id']}.txt"
+            raw = None
+            if row["operation"] != "open":
+                raw = directory / f"{row['job_id']}.txt"
+                atomic_text(raw, result.text)
             metadata = directory / f"{row['job_id']}.result.json"
-            atomic_text(raw, result.text)
-            atomic_text(metadata, result.model_dump_json(exclude={"text"}))
-            error = None if result.status == "completed" else f"provider_{result.status}"
-            self._finish(db, result.request_id, result.status, error, str(raw), str(metadata))
+            receipt = result.model_dump(exclude={"text"})
+            receipt.update(
+                {
+                    "operation": row["operation"],
+                    "modes": json.loads(row["modes_json"]),
+                    "chat_url": row["chat_url"],
+                    "accepted_status": status,
+                    "accepted_error": error,
+                    "trusted_conversation_url": url,
+                }
+            )
+            atomic_text(metadata, json.dumps(receipt, ensure_ascii=False))
+            db.execute(
+                "UPDATE commands SET conversation_url=? WHERE request_id=?",
+                (url, result.request_id),
+            )
+            self._finish(
+                db,
+                result.request_id,
+                status,
+                error,
+                str(raw) if raw is not None else None,
+                str(metadata),
+            )
             return True
 
     def uncertain(self, request_id: str, owner: str, reason: str) -> None:
@@ -329,12 +490,12 @@ class Store:
         with self.connect(transaction=True) as db:
             rows = db.execute(
                 "SELECT c.request_id,c.state FROM commands c LEFT JOIN hosts h ON c.owner=h.owner "
-                "WHERE (c.state='pending' AND c.created<?) OR "
+                "WHERE (c.state IN ('pending','pending_v2','pending_v3') AND c.created<?) OR "
                 "(c.state='sent' AND (c.deadline<? OR h.owner IS NULL OR h.heartbeat<?))",
                 (now - self.settings.queue_timeout, now, now - self.settings.host_lease),
             ).fetchall()
             for row in rows:
-                status = "timeout" if row["state"] == "pending" else "unknown"
+                status = "unknown" if row["state"] == "sent" else "timeout"
                 reason = "native_host_unavailable" if status == "timeout" else "delivery_uncertain"
                 self._finish(db, row["request_id"], status, reason)
             db.execute("DELETE FROM hosts WHERE heartbeat<?", (now - self.settings.host_lease,))
@@ -359,7 +520,9 @@ class Store:
         with self.connect(transaction=True) as db:
             # Unsent commands can be cancelled safely; sent ones must finish/expire.
             rows = db.execute(
-                "SELECT request_id FROM commands WHERE task_id=? AND state='pending'", (task_id,)
+                "SELECT request_id FROM commands WHERE task_id=? "
+                "AND state IN ('pending','pending_v2','pending_v3')",
+                (task_id,),
             ).fetchall()
             for row in rows:
                 self._finish(db, row["request_id"], "failed", reason)

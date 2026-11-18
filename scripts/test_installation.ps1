@@ -15,6 +15,8 @@ foreach ($file in $files) {
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 & $python (Join-Path $PSScriptRoot 'validate_examples.py') (Join-Path $ProjectRoot 'examples')
 if ($LASTEXITCODE -ne 0) { throw 'Example plan validation failed.' }
+& $python (Join-Path $PSScriptRoot 'test_provider_launchers.py') $ProjectRoot
+if ($LASTEXITCODE -ne 0) { throw 'Provider launcher validation failed.' }
 $testParent = (Resolve-Path -LiteralPath (Join-Path $ProjectRoot '.venv')).Path
 $testRoot = Join-Path $testParent ('installation-test-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $testRoot
@@ -74,7 +76,7 @@ sys.stderr.write("MOCK_STDERR_ONLY\n")
     $rejected = $false
     try { & (Join-Path $PSScriptRoot 'install_skill.ps1') -ProjectRoot $ProjectRoot -SkillDirectory $unrelated | Out-Null } catch { $rejected = $true }
     if (-not $rejected -or (Get-Content -Raw -LiteralPath (Join-Path $unrelated 'SKILL.md')) -ne 'KEEP_UNRELATED') { throw 'Unrelated skill was overwritten.' }
-    [PSCustomObject]@{ PowerShellParse = 'passed'; BinaryLauncher = 'passed'; Manifest = 'passed'; RegistryUnchanged = $true; SkillInstall = 'passed'; UnrelatedSkillProtected = $true; LiveProvidersTested = $false }
+    [PSCustomObject]@{ PowerShellParse = 'passed'; ProviderLaunchers = 'passed'; BinaryLauncher = 'passed'; Manifest = 'passed'; RegistryUnchanged = $true; SkillInstall = 'passed'; UnrelatedSkillProtected = $true; LiveProvidersTested = $false }
 } finally {
     # Check the resolved absolute target before deleting only our isolated test tree.
     $resolvedTest = [IO.Path]::GetFullPath($testRoot)

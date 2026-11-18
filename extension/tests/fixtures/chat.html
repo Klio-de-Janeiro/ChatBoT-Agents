@@ -31,6 +31,24 @@
       <button aria-label="User menu" data-testid="user-menu">Signed-in account</button
       ><a href="/">New chat</a>
     </nav>
+    <section id="mode-controls">
+      <div class="ds-toggle-button" role="button" tabindex="0" aria-pressed="false">DeepThink</div>
+      <div class="ds-toggle-button" role="button" tabindex="0" aria-pressed="false">Search</div>
+      <button class="qwen-chat-v2-dropdown-menu-select-button">
+        <span class="qwen-chat-v2-dropdown-menu-select-label">Fast</span>
+      </button>
+      <div
+        id="tools-trigger"
+        class="mode-select-open"
+        role="button"
+        tabindex="0"
+        aria-label="Select mode"
+      >
+        Tools
+      </div>
+      <div id="active-tool"></div>
+      <div id="mode-menu"></div>
+    </section>
     <main id="messages"></main>
     <textarea id="chat-input" placeholder="Message DeepSeek"></textarea>
     <button id="send-message-button" aria-label="Send message" data-testid="send-button">
@@ -39,6 +57,82 @@
     <script>
       const mode = localStorage.getItem('mock-mode') || 'stream';
       window.fixture = { mode, clicks: 0, started: 0, finished: 0 };
+      window.modeFixture = {
+        events: { think: 0, search: 0, reasoning: 0, tools: 0, close: 0 },
+        order: [],
+        inputEvents: 0,
+        failure: localStorage.getItem('mock-mode-failure') || '',
+      };
+      document.querySelector('textarea').addEventListener('input', () => modeFixture.inputEvents++);
+      for (const toggle of document.querySelectorAll('.ds-toggle-button')) {
+        toggle.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter') return;
+          const name = toggle.textContent === 'DeepThink' ? 'think' : 'search';
+          modeFixture.events[name]++;
+          modeFixture.order.push(name);
+          if (modeFixture.failure === 'ignore-' + name) return;
+          toggle.setAttribute(
+            'aria-pressed',
+            String(toggle.getAttribute('aria-pressed') !== 'true'),
+          );
+        });
+      }
+      const reasoningLabel = document.querySelector('.qwen-chat-v2-dropdown-menu-select-label');
+      const menuContainer = document.querySelector('#mode-menu');
+      const display = { fast: 'Fast', thinking: 'Thinking', auto: 'Auto' };
+      document.querySelector('.qwen-chat-v2-dropdown-menu-select-button').onclick = () => {
+        menuContainer.innerHTML = '<div role="menu" aria-label="В раздумье"></div>';
+        const menu = menuContainer.firstChild;
+        for (const [state, text] of Object.entries(display)) {
+          const option = document.createElement('button');
+          option.setAttribute('role', 'menuitem');
+          option.textContent = text;
+          if (reasoningLabel.textContent === text)
+            option.className = 'qwen-chat-v2-dropdown-menu-item-selected';
+          option.onclick = () => {
+            modeFixture.events.reasoning++;
+            modeFixture.order.push('reasoning');
+            if (modeFixture.failure !== 'ignore-reasoning') reasoningLabel.textContent = text;
+            menuContainer.innerHTML = '';
+            if (modeFixture.failure === 'reset-search')
+              setTimeout(() => (document.querySelector('#active-tool').innerHTML = ''), 40);
+          };
+          menu.append(option);
+        }
+      };
+      function activeTool(text) {
+        const holder = document.querySelector('#active-tool');
+        holder.innerHTML = '';
+        const chip = document.createElement('div');
+        chip.className = 'mode-select-current-mode';
+        chip.setAttribute('aria-disabled', 'false');
+        chip.textContent = text;
+        const close = document.createElement('span');
+        close.className = 'mode-select-current-mode-close';
+        close.setAttribute('role', 'img');
+        close.setAttribute('aria-label', 'Close');
+        close.style.cssText = 'display:inline-block;width:16px;height:16px;background:#ccc';
+        close.onclick = () => {
+          modeFixture.events.close++;
+          modeFixture.order.push('close');
+          chip.remove();
+        };
+        chip.append(close);
+        holder.append(chip);
+      }
+      window.setFixtureTool = activeTool;
+      document.querySelector('#tools-trigger').onclick = () => {
+        modeFixture.events.tools++;
+        menuContainer.innerHTML =
+          '<div role="menu"><button role="menuitem"><span class="mode-select-dropdown-item-name">Web search</span></button></div>';
+        menuContainer.querySelector('[role=menuitem]').onclick = () => {
+          modeFixture.events.search++;
+          modeFixture.order.push('search');
+          if (modeFixture.failure !== 'ignore-search') activeTool('Web search');
+          reasoningLabel.textContent = 'Fast';
+          menuContainer.innerHTML = '';
+        };
+      };
       const messages = document.querySelector('#messages');
       const composer = document.querySelector('textarea');
       const send = document.querySelector('#send-message-button');
@@ -77,6 +171,11 @@
       send.onclick = () => {
         window.fixture.clicks++;
         window.fixture.started = Date.now();
+        window.fixture.sentModes = {
+          think: document.querySelector('.ds-toggle-button').getAttribute('aria-pressed'),
+          reasoning: reasoningLabel.textContent,
+          tool: document.querySelector('.mode-select-current-mode')?.textContent,
+        };
         const prompt = composer.value;
         composer.value = '';
         send.disabled = true;

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import re
+from html import escape
 from pathlib import Path
 
 import nbformat
 
 from .files import atomic_text
-from .models import Cell, CellDocument
+from .models import Cell, CellDocument, OutputFormat
 
 CELL_INSTRUCTION = (
     'Return ONLY a JSON object {"cells":[{"cell_type":"markdown|code","source":"..."}]}. '
@@ -26,7 +27,7 @@ def parse_cells(raw: str) -> CellDocument:
     return CellDocument.model_validate_json(text)
 
 
-def write_artifact(document: CellDocument, path: Path, output_format: str) -> None:
+def write_artifact(document: CellDocument, path: Path, output_format: OutputFormat) -> None:
     if output_format == "ipynb":
         cells = [
             nbformat.v4.new_markdown_cell(cell.source)
@@ -40,7 +41,7 @@ def write_artifact(document: CellDocument, path: Path, output_format: str) -> No
         )
         nbformat.validate(notebook)
         atomic_text(path, nbformat.writes(notebook))
-    elif output_format == "markdown":
+    elif output_format in {"md", "markdown"}:
         sections = []
         for cell in document.cells:
             # Longer delimiters preserve source containing triple backticks.
@@ -53,8 +54,28 @@ def write_artifact(document: CellDocument, path: Path, output_format: str) -> No
                 else f"{fence}python\n{cell.source}\n{fence}"
             )
         atomic_text(path, "\n\n".join(sections) + "\n")
+    elif output_format == "txt":
+        atomic_text(path, "\n\n".join(cell.source for cell in document.cells))
+    elif output_format == "json":
+        atomic_text(path, document.model_dump_json(indent=2) + "\n")
+    elif output_format == "html":
+        body = "\n".join(f"<pre>{escape(cell.source)}</pre>" for cell in document.cells)
+        atomic_text(
+            path,
+            '<!doctype html>\n<meta charset="utf-8">\n<title>MultiChatAgent</title>\n'
+            + body
+            + "\n",
+        )
     else:
         raise ValueError("unsupported output format")
+
+
+def write_answer(text: str, path: Path, output_format: OutputFormat) -> None:
+    if output_format in {"txt", "md", "markdown"}:
+        atomic_text(path, text)
+        return
+    document = CellDocument(cells=[Cell(cell_type="markdown", source=text)])
+    write_artifact(document, path, output_format)
 
 
 def author_document(outputs: list[tuple[str, str]]) -> CellDocument:

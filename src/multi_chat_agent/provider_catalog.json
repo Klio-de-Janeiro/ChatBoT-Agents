@@ -1,0 +1,65 @@
+{
+  "deepseek": {
+    "name": "DeepSeek",
+    "origin": "https://chat.deepseek.com",
+    "start": "/",
+    "home": [
+      "/"
+    ],
+    "thread": null,
+    "modes": [
+      "think",
+      "search"
+    ],
+    "resume_paths": [
+      "/a/chat/s/"
+    ]
+  },
+  "qwen": {
+    "name": "Qwen",
+    "origin": "https://chat.qwen.ai",
+    "start": "/",
+    "home": [
+      "/"
+    ],
+    "thread": null,
+    "modes": [
+      "think",
+      "search",
+      "reasoning"
+    ],
+    "resume_paths": [
+      "/c/"
+    ]
+  },
+  "kimi": {
+    "name": "Kimi",
+    "origin": "https://www.kimi.ai",
+    "start": "/en",
+    "home": [
+      "/",
+      "/en"
+    ],
+    "thread": "/chat/",
+    "modes": [],
+    "resume_paths": [
+      "/chat/"
+    ]
+  },
+  "perplexity": {
+    "name": "Perplexity",
+    "origin": "https://www.perplexity.ai",
+    "start": "/",
+    "home": [
+      "/",
+      "/ru",
+      "/en"
+    ],
+    "thread": "/session/",
+    "modes": [],
+    "resume_paths": [
+      "/session/",
+      "/search/"
+    ]
+  }
+}

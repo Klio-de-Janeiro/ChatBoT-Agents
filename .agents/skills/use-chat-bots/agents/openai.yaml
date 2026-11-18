@@ -1,4 +1,4 @@
 interface:
   display_name: "Use Chat Bots"
-  short_description: "Поручения веб-ботам через локальный MCA CLI"
+  short_description: "Открытие веб-чатов, режимы и задания через MCA"
   default_prompt: "Используй $use-chat-bots: составь план для DeepSeek и Qwen, передай все результаты отдельному веб-редактору и верни файл."

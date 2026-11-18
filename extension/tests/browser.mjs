@@ -16,7 +16,11 @@ const profile = await mkdtemp(path.join(work, 'test-profile-'));
 await writeFile(
   path.join(harness, 'native-harness.js'),
   `
-globalThis.__native={out:[],listeners:[],disconnects:[],post(message){for(const listener of this.listeners)listener(message)}};
+globalThis.__native={out:[],errors:[],listeners:[],disconnects:[],post(message){for(const listener of this.listeners)listener(message)}};
+for(const [group,name] of [['windows','create'],['windows','get'],['tabs','query'],['tabs','get']]){
+  const original=chrome[group][name].bind(chrome[group]);
+  chrome[group][name]=async(...args)=>{try{return await original(...args)}catch(error){__native.errors.push([group+'.'+name,error.message]);throw error}};
+}
 chrome.runtime.connectNative=(name)=>{if(name!=='com.multichat.agent')throw new Error('Wrong host');return {
 postMessage(message){__native.out.push(message)},onMessage:{addListener(fn){__native.listeners.push(fn)}},
 onDisconnect:{addListener(fn){__native.disconnects.push(fn)}}}};
@@ -25,6 +29,8 @@ importScripts('background.js');
 );
 const manifest = JSON.parse(await readFile(path.join(harness, 'manifest.json'), 'utf8'));
 manifest.background.service_worker = 'native-harness.js';
+// Simulate an already loaded page after an extension upgrade.
+manifest.content_scripts[0].exclude_matches = ['https://chat.qwen.ai/c/stale-fixture'];
 await writeFile(path.join(harness, 'manifest.json'), JSON.stringify(manifest));
 await build({
   entryPoints: ['src/dom.ts'],
@@ -65,6 +71,8 @@ const launch = () =>
       `--load-extension=${harness}`,
       '--no-proxy-server',
       '--ignore-certificate-errors',
+      '--screen-info={0,0 800x600}',
+      '--window-size=800,600',
       `--host-resolver-rules=MAP chat.deepseek.com 127.0.0.1:${port},MAP chat.qwen.ai 127.0.0.1:${port}`,
     ],
   });
@@ -186,6 +194,129 @@ try {
       assert.equal(await page.evaluate(() => fixture.clicks), 2);
     },
   );
+  await check(
+    'open and ask share a tab, and draft replacement requires explicit consent',
+    async () => {
+      for (const provider of ['deepseek', 'qwen']) {
+        const before = new Set(context.pages());
+        const opened = job(provider, { operation: 'open', modes: { think: true, search: true } });
+        await dispatch(opened);
+        const r = await response(opened);
+        assert.equal(r.status, 'completed', JSON.stringify(r));
+        assert.equal(r.text, '');
+        const page = signed[provider];
+        assert.equal(context.pages().length, before.size);
+        assert.equal(page.url(), r.conversation_url);
+        const initial = await page.evaluate(() => ({
+          fixture,
+          modeFixture,
+          composer: document.querySelector('textarea').value,
+        }));
+        assert.equal(initial.fixture.clicks, 0);
+        assert.equal(initial.modeFixture.inputEvents, 0);
+        assert.equal(initial.composer, '');
+        assert.deepEqual(
+          initial.modeFixture.order,
+          provider === 'qwen' ? ['search', 'reasoning'] : ['search', 'think'],
+        );
+        const repeat = job(provider, {
+          operation: 'open',
+          conversation_key: opened.conversation_key,
+          modes: { search: true, think: true },
+        });
+        await dispatch(repeat);
+        assert.equal((await response(repeat)).status, 'completed');
+        await dispatch(opened);
+        assert.equal((await response(opened)).status, 'completed');
+        assert.deepEqual(await page.evaluate(() => modeFixture.events), initial.modeFixture.events);
+        const unsupported = job(provider, {
+          conversation_key: opened.conversation_key,
+          modes: { model: 'unregistered' },
+        });
+        await dispatch(unsupported);
+        const rejected = await response(unsupported);
+        assert.equal(rejected.status, 'needs_user_action');
+        assert.match(rejected.error, /MODE_UNSUPPORTED/);
+        assert.equal(await page.evaluate(() => modeFixture.inputEvents), 0);
+        assert.equal(await page.evaluate(() => fixture.clicks), 0);
+        const textarea = page.locator('textarea');
+        await textarea.fill('Draft from an earlier test');
+        const blocked = job(provider);
+        await dispatch(blocked);
+        assert.match((await response(blocked)).error, /USER_DRAFT/);
+        assert.equal(await textarea.inputValue(), 'Draft from an earlier test');
+        const ask = job(provider, {
+          modes: { think: false, search: false, 'replace-draft': true },
+        });
+        await dispatch(ask);
+        const answer = await response(ask);
+        assert.equal(answer.status, 'completed', JSON.stringify(answer));
+        const answerPage = context.pages().find((p) => p.url() === answer.conversation_url);
+        assert.equal(answerPage, page);
+        assert.equal(context.pages().length, before.size);
+        const sent = await answerPage.evaluate(() => fixture.sentModes);
+        if (provider === 'deepseek') assert.equal(sent.think, 'false');
+        else {
+          assert.equal(sent.reasoning, 'Fast');
+          assert.equal(sent.tool, undefined);
+        }
+        assert.equal(await answerPage.evaluate(() => fixture.clicks), 1);
+      }
+    },
+  );
+  await check(
+    'already loaded tab reconnects after extension update without losing its draft',
+    async () => {
+      const page = await context.newPage();
+      const url = origins.qwen + '/c/stale-fixture';
+      await page.goto(url);
+      const textarea = page.locator('textarea');
+      await textarea.fill('Draft to preserve');
+      const before = context.pages().length;
+      const opened = job('qwen', { operation: 'open', chat_url: url });
+      await dispatch(opened);
+      assert.equal((await response(opened)).status, 'completed');
+      const blocked = job('qwen');
+      await dispatch(blocked);
+      assert.match((await response(blocked)).error, /USER_DRAFT/);
+      assert.equal(await textarea.inputValue(), 'Draft to preserve');
+      assert.equal(page.url(), url);
+      assert.equal(context.pages().length, before);
+      const allowed = job('qwen', { modes: { 'replace-draft': true } });
+      await dispatch(allowed);
+      const answer = await response(allowed);
+      assert.equal(answer.status, 'completed', JSON.stringify(answer));
+      assert.equal(page.url(), answer.conversation_url);
+      assert.equal(context.pages().length, before);
+      assert.equal(await page.evaluate(() => fixture.clicks), 1);
+      await page.close();
+    },
+  );
+  await check('open uses the same tab for a saved chat and preserves drafts', async () => {
+    const page = await context.newPage();
+    await page.goto(origins.deepseek + '/');
+    const original = page.url();
+    const target = origins.deepseek + '/a/chat/s/old-chat';
+    const count = context.pages().length;
+    const composer = page.locator('textarea');
+    await composer.fill('Unsent draft');
+    const blocked = job('deepseek', { operation: 'open', chat_url: target });
+    await dispatch(blocked);
+    assert.match((await response(blocked)).error, /USER_DRAFT/);
+    assert.equal(page.url(), original);
+    assert.equal(await composer.inputValue(), 'Unsent draft');
+
+    await composer.fill('');
+    const viewing = job('deepseek', { operation: 'open', chat_url: target });
+    await dispatch(viewing);
+    const shown = await response(viewing);
+    assert.equal(shown.status, 'completed', JSON.stringify(shown));
+    assert.equal(shown.conversation_url, target);
+    assert.equal(page.url(), target);
+    assert.equal(context.pages().length, count);
+    assert.equal(await page.evaluate(() => fixture.clicks), 0);
+    await page.close();
+  });
   await check('partial paused stream times out and quarantines conversation', async () => {
     await mode('deepseek', 'paused');
     const j = job('deepseek', { timeout_ms: 1200 });
@@ -339,6 +470,11 @@ try {
     `Browser integration: ${checks} checks passed (Chromium ${context.browser()?.version() ?? 'persistent'}, real MV3; native port mocked; provider origins mapped to local HTTPS server).`,
   );
 } catch (error) {
+  for (const worker of context.serviceWorkers())
+    console.error(
+      'DEBUG CHROME API',
+      await worker.evaluate(() => globalThis.__native?.errors).catch(() => []),
+    );
   for (const page of context.pages()) {
     console.error(
       'DEBUG PAGE',

@@ -1,21 +1,30 @@
 {
   "manifest_version": 3,
   "name": "MultiChat Agent",
-  "version": "0.1.1",
+  "version": "0.2.7",
   "minimum_chrome_version": "120",
-  "description": "Native Messaging bridge for dedicated DeepSeek and Qwen chats.",
-  "permissions": ["nativeMessaging", "storage", "unlimitedStorage", "tabs", "alarms"],
-  "host_permissions": ["https://chat.deepseek.com/*", "https://chat.qwen.ai/*"],
-  "background": { "service_worker": "background.js" },
+  "description": "Native Messaging bridge for dedicated web chats.",
+  "permissions": ["nativeMessaging", "storage", "unlimitedStorage", "tabs", "alarms", "scripting"],
+  "host_permissions": [],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
-      "matches": ["https://chat.deepseek.com/*", "https://chat.qwen.ai/*"],
+      "matches": [],
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false
     }
   ],
-  "action": { "default_title": "MultiChat Agent settings" },
-  "options_ui": { "page": "options.html", "open_in_tab": true },
-  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'" }
+  "action": {
+    "default_title": "MultiChat Agent settings"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  }
 }

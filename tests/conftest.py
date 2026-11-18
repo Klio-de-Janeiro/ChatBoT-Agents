@@ -14,10 +14,10 @@ def store(tmp_path: Path) -> Store:
     return Store(
         Settings(
             home=tmp_path / "state",
-            poll_interval=0.005,
-            queue_timeout=0.3,
-            host_lease=0.2,
-            io_timeout=0.05,
+            poll_interval=0.01,
+            queue_timeout=1,
+            host_lease=2,
+            io_timeout=0.5,
         )
     )
 

@@ -11,7 +11,7 @@ const job = {
   timeout_ms: 1000,
 };
 test('wire accepts canonical job and rejects malformed/unbounded jobs', () => {
-  assert.deepEqual(parseJob(job), job);
+  assert.deepEqual(parseJob(job), { ...job, operation: 'ask', modes: {} });
   for (const patch of [
     { request_id: '../foo' },
     { prompt: '' },
@@ -33,6 +33,30 @@ test('wire accepts canonical job and rejects malformed/unbounded jobs', () => {
   );
   assert.throws(() => parseJob({ ...job, prompt: '\n'.repeat(MAX_PROMPT_BYTES - 1) + 'a' }));
   for (const value of [null, [], 42, 'job']) assert.throws(() => parseJob(value));
+});
+test('operation and modes are strict, bounded, canonical and backwards compatible', () => {
+  const modes = { think: true, search: false, reasoning: 'auto' };
+  assert.deepEqual(parseJob({ ...job, operation: 'open', modes }).modes, {
+    reasoning: 'auto',
+    search: false,
+    think: true,
+  });
+  for (const patch of [
+    { operation: 'launch' },
+    { operation: null },
+    { modes: null },
+    { modes: [] },
+    { modes: { Think: true } },
+    { modes: { ['a'.repeat(33)]: true } },
+    { modes: { search: 0 } },
+    { modes: { search: ' ' } },
+    { modes: { search: 'x'.repeat(101) } },
+    { modes: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`m${i}`, true])) },
+  ])
+    assert.throws(() => parseJob({ ...job, ...patch }));
+  const empty = result(job, 'completed', undefined, '', 'https://chat.qwen.ai/');
+  assert.equal(validResult(empty, { ...job, operation: 'open' }), true);
+  assert.equal(validResult(empty, job), false);
 });
 test('origin allowlist is exact HTTPS and rejects deceptive URLs', () => {
   assert.equal(originProvider('https://chat.qwen.ai/c/123'), 'qwen');

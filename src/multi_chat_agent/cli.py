@@ -19,8 +19,10 @@ from pydantic import ValidationError
 from . import __version__
 from .config import Settings
 from .errors import AgentError
-from .models import JobPlan, OutputPlan, Plan
+from .models import OPEN_PROMPT, OUTPUT_EXTENSIONS, JobPlan, OutputPlan, Plan
+from .modes import parse_modes
 from .native_host import NativeHost, StdioTransport
+from .providers import PROVIDERS, registry_summary
 from .scheduler import Scheduler
 from .store import Store
 
@@ -51,18 +53,33 @@ def positive_seconds(raw: str) -> float:
 def parser() -> JsonParser:
     result = JsonParser(prog="mca", description="Durable local browser chat orchestration")
     commands = result.add_subparsers(
-        dest="command", required=True, metavar="{run,ask,status,doctor,native-host}"
+        dest="command", required=True, metavar="{run,ask,open,providers,status,doctor,native-host}"
     )
     run = commands.add_parser("run", help="enqueue a JSON plan; resume an identical task safely")
     run.add_argument("plan", type=Path)
     ask = commands.add_parser("ask", help="save a single provider's raw response to a local file")
-    ask.add_argument("provider", choices=("deepseek", "qwen"))
     prompt = ask.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt")
     prompt.add_argument("--prompt-file", type=Path)
-    ask.add_argument("--timeout", type=positive_seconds, default=180)
-    ask.add_argument("--task-id", help="optional durable ID, otherwise a new random ID")
-    for command in (run, ask):
+    ask.add_argument(
+        "--replace-draft", action="store_true", help="discard an existing draft in the target tab"
+    )
+    ask.add_argument("--format", choices=tuple(OUTPUT_EXTENSIONS), help="format of the answer file")
+    ask.add_argument(
+        "--output", type=Path, help="destination file, relative to the current directory"
+    )
+    launch = commands.add_parser(
+        "open", help="open an owned provider conversation without submitting"
+    )
+    for command in (ask, launch):
+        command.add_argument("provider", choices=tuple(PROVIDERS))
+        command.add_argument("--chat-url", help="URL of an existing chat")
+        command.add_argument("--timeout", type=positive_seconds, default=180)
+        command.add_argument("--task-id", help="optional durable ID, otherwise a new random ID")
+        command.add_argument("--think", choices=("on", "off"), action="append", default=[])
+        command.add_argument("--search", choices=("on", "off"), action="append", default=[])
+        command.add_argument("--mode", metavar="NAME=VALUE", action="append", default=[])
+    for command in (run, ask, launch):
         command.add_argument("--wait", action="store_true")
         command.add_argument(
             "--wait-timeout",
@@ -74,6 +91,7 @@ def parser() -> JsonParser:
     status.add_argument("--wait", action="store_true")
     status.add_argument("--wait-timeout", type=positive_seconds)
     commands.add_parser("doctor", help="report local configuration without response bodies")
+    commands.add_parser("providers", help="list provider adapters and configurable modes")
     commands.add_parser("native-host", help="Chrome native messaging entrypoint")
     worker = commands.add_parser("_worker")
     worker.add_argument("task_id")
@@ -169,6 +187,36 @@ def _doctor(store: Store) -> dict[str, Any]:
     }
 
 
+def direct_output(args: argparse.Namespace, task_dir: Path) -> OutputPlan:
+    # Retain the original plan defaults so old task IDs can still be resumed.
+    if args.command == "open" or (args.format is None and args.output is None):
+        return OutputPlan(format="markdown", path=str(task_dir / "answer.txt"))
+
+    output_format = args.format
+    destination = args.output.expanduser() if args.output is not None else None
+    if destination is not None and destination.is_dir():
+        raise AgentError("output_is_directory", "--output must name a file")
+    if destination is not None and destination.suffix:
+        suffix = destination.suffix.lower()
+        if output_format is None:
+            output_format = next(
+                (name for name, ext in OUTPUT_EXTENSIONS.items() if ext == suffix), None
+            )
+            if output_format is None:
+                raise AgentError(
+                    "unsupported_output_extension", "choose a supported file extension"
+                )
+        elif OUTPUT_EXTENSIONS[output_format] != suffix:
+            raise AgentError("output_extension_mismatch", "the filename must match --format")
+    output_format = output_format or "txt"
+    suffix = OUTPUT_EXTENSIONS[output_format]
+    if destination is None:
+        destination = task_dir / "responses" / ("answer" + suffix)
+    elif not destination.suffix:
+        destination = destination.with_name(destination.name + suffix)
+    return OutputPlan(format=output_format, path=str(destination.expanduser().resolve()))
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     # Chrome appends an origin and potentially --parent-window; these are host arguments.
@@ -176,6 +224,9 @@ def main(argv: list[str] | None = None) -> int:
         return _native()
     try:
         args = parser().parse_args(arguments)
+        if args.command == "providers":
+            emit(registry_summary())
+            return 0
         store = Store(Settings.from_env())
         if args.command == "doctor":
             store.expire()
@@ -205,28 +256,38 @@ def main(argv: list[str] | None = None) -> int:
                 plan.output.path = str(output.resolve())
                 store.submit(plan)
             else:
-                prompt_text = (
-                    args.prompt
-                    if args.prompt is not None
-                    else (args.prompt_file.read_text(encoding="utf-8-sig"))
-                )
-                task_id = args.task_id or f"ask-{uuid.uuid4().hex}"
+                mode_flags = args.mode
+                if args.command == "ask" and args.replace_draft:
+                    mode_flags = [*mode_flags, "replace-draft=on"]
+                modes = parse_modes(think=args.think, search=args.search, extra=mode_flags)
+                if args.command == "open":
+                    prompt_text = OPEN_PROMPT
+                else:
+                    prompt_text = (
+                        args.prompt
+                        if args.prompt is not None
+                        else args.prompt_file.read_text(encoding="utf-8-sig")
+                    )
+                task_id = args.task_id or f"{args.command}-{uuid.uuid4().hex}"
                 plan = Plan(
                     task_id=task_id,
-                    objective="Direct provider ask",
+                    objective="Open provider conversation"
+                    if args.command == "open"
+                    else "Direct provider ask",
                     jobs=[
                         JobPlan(
-                            id="answer",
+                            id="conversation" if args.command == "open" else "answer",
                             provider=args.provider,
                             prompt=prompt_text,
                             timeout=args.timeout,
+                            operation=args.command,
+                            modes=modes,
+                            chat_url=args.chat_url,
                         )
                     ],
-                    output=OutputPlan(
-                        format="markdown", path=str(store.task_dir(task_id) / "answer.txt")
-                    ),
+                    output=direct_output(args, store.task_dir(task_id)),
                 )
-                store.submit(plan, kind="ask")
+                store.submit(plan, kind=args.command)
             summary = _start(store, plan.task_id, wait=args.wait, wait_timeout=args.wait_timeout)
         emit(summary)
         if summary.get("wait_timeout"):

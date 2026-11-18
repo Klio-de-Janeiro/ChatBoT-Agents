@@ -53,7 +53,9 @@ async def drive(store, task_id, transport):
     stop = False
     host = asyncio.create_task(NativeHost(store, transport).run(stop=lambda: stop))
     try:
-        summary = await asyncio.wait_for(Scheduler(store).run(task_id), timeout=3)
+        # Windows durable fsyncs can take hundreds of milliseconds under parallel
+        # integration runs; the outer bound detects hangs, not disk throughput.
+        summary = await asyncio.wait_for(Scheduler(store).run(task_id), timeout=10)
         return summary
     finally:
         stop = True

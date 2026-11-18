@@ -8,6 +8,7 @@ import {
   type Job,
   type Result,
   type Provider,
+  canonicalModes,
 } from './protocol';
 import type { Settings } from './config';
 export interface Store {
@@ -15,7 +16,14 @@ export interface Store {
   set(key: string, value: unknown): Promise<void>;
   all<T>(prefix: string): Promise<Record<string, T>>;
 }
-export type Conversation = { tabId: number; token: string; url: string; blocked?: boolean };
+export type Conversation = {
+  tabId: number;
+  token: string;
+  url: string;
+  blocked?: boolean;
+  view?: true;
+  prepared?: true;
+};
 export interface Platform {
   settings(): Promise<Settings>;
   prepare(job: Job, settings: Settings, key: string): Promise<Conversation>;
@@ -52,6 +60,20 @@ export async function digest(value: unknown): Promise<string> {
     new TextEncoder().encode(JSON.stringify(value)),
   );
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+export function legacyFingerprint(job: Job): Promise<string> {
+  return digest([job.provider, job.prompt, job.conversation_key, job.timeout_ms]);
+}
+export function requestFingerprint(job: Job): Promise<string> {
+  return digest([
+    job.provider,
+    job.prompt,
+    job.conversation_key,
+    job.timeout_ms,
+    job.operation ?? 'ask',
+    canonicalModes(job.modes),
+    ...(job.chat_url ? [job.chat_url] : []),
+  ]);
 }
 export class Engine {
   private reservation = new Serial();
@@ -97,19 +119,23 @@ export class Engine {
       return;
     }
     // Canonical key order makes equivalent wire objects identical regardless of JSON property order.
-    const fingerprint = await digest([
+    const fingerprint = await requestFingerprint(job);
+    // v0.1 records used the four-field digest. Only legacy ask/default semantics
+    // can match those tombstones; new operation/mode requests must never reuse them.
+    const legacy =
+      job.operation === 'ask' && !job.chat_url && !Object.keys(job.modes ?? {}).length
+        ? await legacyFingerprint(job)
+        : undefined;
+    const key = await digest([
       job.provider,
-      job.prompt,
-      job.conversation_key,
-      job.timeout_ms,
+      job.chat_url ? ['saved', job.chat_url] : job.conversation_key,
     ]);
-    const key = await digest([job.provider, job.conversation_key]);
     let claimed = false;
     try {
       await this.reservation.run(job.request_id, async () => {
         const old = await this.store.get<RecordState>(`request:${job.request_id}`);
         if (old) {
-          if (old.fingerprint !== fingerprint)
+          if (old.fingerprint !== fingerprint && old.fingerprint !== legacy)
             this.emit(
               result(job, 'failed', 'REQUEST_ID_CONFLICT: Reused request ID with different input'),
             );
@@ -191,7 +217,7 @@ export class Engine {
           this.quarantined.add(key);
           await this.store.set(`blocked:${key}`, true);
         }
-        if (response.status === 'completed' && conversation) {
+        if (response.status === 'completed' && conversation && !conversation.view) {
           await this.store.set(`conversation:${key}`, {
             ...conversation,
             url: response.conversation_url,

@@ -11,14 +11,17 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .assembler import CELL_INSTRUCTION, author_document, parse_cells, write_artifact
+from .assembler import CELL_INSTRUCTION, author_document, parse_cells, write_answer, write_artifact
 from .errors import AgentError
 from .files import atomic_text
-from .models import TERMINAL, Plan
+from .models import OPEN_PROMPT, TERMINAL, Plan
 from .store import Store
 
 
 def read_response(job: dict[str, Any]) -> str:
+    if job["operation"] == "open":
+        # A dependency may launch a conversation. Its result is metadata, never a body.
+        return json.dumps({"operation": "open", "conversation_url": job["conversation_url"]})
     if not job["result_path"]:
         raise AgentError("response_missing", "completed response file is missing")
     return Path(job["result_path"]).read_text(encoding="utf-8")
@@ -94,17 +97,39 @@ class Scheduler:
                 and jobs[job.id]["status"] == "pending"
                 and all(jobs[dep]["status"] == "completed" for dep in job.depends_on)
             ):
-                dependencies = [(dep, read_response(jobs[dep])) for dep in job.depends_on]
-                self.store.enqueue(task_id, job.id, dependency_prompt(job.prompt, dependencies))
+                if job.operation == "open":
+                    prompt = OPEN_PROMPT
+                else:
+                    dependencies = [(dep, read_response(jobs[dep])) for dep in job.depends_on]
+                    prompt = dependency_prompt(job.prompt, dependencies)
+                self.store.enqueue(task_id, job.id, prompt)
                 busy_providers.add(job.provider)
         jobs = self.store.jobs(task_id)
         if not all(jobs[job.id]["status"] == "completed" for job in plan.jobs):
             return
+        if task["kind"] == "open":
+            # Store accepts a completed open only with a validated provider URL.
+            # Neither the response body nor the notebook assembler is involved.
+            self.store.set_task(task_id, "completed")
+            return
         if task["kind"] == "ask":
-            # The provider's raw UTF-8 file is the deliverable for a direct ask.
-            self.store.set_task(
-                task_id, "completed", output_path=jobs[plan.jobs[0].id]["result_path"]
-            )
+            job = jobs[plan.jobs[0].id]
+            if not job["result_path"]:
+                raise AgentError("response_missing", "completed response file is missing")
+            raw = Path(job["result_path"])
+            destination = Path(plan.output.path)
+            legacy_path = self.store.task_dir(task_id) / "answer.txt"
+            if plan.output.format == "markdown" and destination == legacy_path:
+                destination = raw
+            if destination != raw:
+                text = read_response(job)
+                try:
+                    write_answer(text, destination, plan.output.format)
+                except OSError as error:
+                    raise AgentError(
+                        "output_write_failed", "could not save the output file"
+                    ) from error
+            self.store.set_task(task_id, "completed", output_path=str(destination))
             return
         outputs = [(job.id, read_response(jobs[job.id])) for job in plan.jobs]
         if plan.editor:
@@ -141,7 +166,10 @@ class Scheduler:
         else:
             document = author_document(outputs)
         destination = Path(plan.output.path)
-        write_artifact(document, destination, plan.output.format)
+        try:
+            write_artifact(document, destination, plan.output.format)
+        except OSError as error:
+            raise AgentError("output_write_failed", "could not save the output file") from error
         self.store.set_task(task_id, "completed", output_path=str(destination))
 
     def default_wait(self, task_id: str) -> float:

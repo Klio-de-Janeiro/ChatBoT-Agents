@@ -5,7 +5,18 @@ import {
   type Settings,
   type ProviderConfig,
 } from './config';
-import { Diagnostic, isObject, originProvider, ORIGINS, type Job, type Result } from './protocol';
+import {
+  catalog,
+  Diagnostic,
+  isObject,
+  originProvider,
+  savedChatUrl,
+  ORIGINS,
+  result,
+  REPLACE_DRAFT,
+  type Job,
+  type Result,
+} from './protocol';
 import { type Store, type Platform, type Conversation } from './engine';
 
 export const store: Store = {
@@ -30,6 +41,8 @@ type Probe = {
   document_token: string;
   message_count: number;
   draft: boolean;
+  busy?: boolean;
+  visible?: boolean;
   error?: string;
 };
 type Pending = {
@@ -66,9 +79,42 @@ export class BrowserPlatform implements Platform {
       throw new Diagnostic('DOM_UNSUPPORTED', 'Provider content script unavailable or unsupported');
     return p as Probe;
   }
+  private async probeExisting(job: Job, tabId: number, config: ProviderConfig): Promise<Probe> {
+    try {
+      return await this.probe(tabId, config);
+    } catch {
+      // Chrome does not inject a new extension build into already loaded pages.
+      // Reconnect the allowed document without reloading it or touching its draft.
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.incognito || tab.pendingUrl || originProvider(tab.url) !== job.provider)
+        throw new Diagnostic('TAB_NAVIGATED', 'The provider tab changed while connecting');
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [0] },
+          files: ['content.js'],
+        });
+        return await this.probe(tabId, config);
+      } catch {
+        throw new Diagnostic(
+          'CONTENT_SCRIPT_UNAVAILABLE',
+          'Allow the extension to access this provider tab',
+        );
+      }
+    }
+  }
+
   async prepare(job: Job, settings: Settings, key: string): Promise<Conversation> {
+    if (job.operation === 'open') {
+      const view = await this.existingView(job);
+      if (view) return view;
+    }
     const config = settings.providers[job.provider];
-    const existing = await store.get<Conversation>(`conversation:${key}`);
+    let existing = await store.get<Conversation>(`conversation:${key}`);
+    if (existing && job.chat_url) {
+      const tab = await chrome.tabs.get(existing.tabId).catch(() => undefined);
+      const ownership = await chrome.storage.session.get(`tab:${existing.tabId}`);
+      if (!tab || ownership[`tab:${existing.tabId}`] !== existing.token) existing = undefined;
+    }
     if (existing) {
       const ownership = (await chrome.storage.session.get(`tab:${existing.tabId}`))[
         `tab:${existing.tabId}`
@@ -87,6 +133,11 @@ export class BrowserPlatform implements Platform {
       if (tab.incognito || tab.url !== existing.url || originProvider(tab.url) !== job.provider)
         throw new Diagnostic('TAB_NAVIGATED', 'Dedicated tab was navigated; inspect manually');
       const probe = await this.probe(existing.tabId, config);
+      if (
+        job.chat_url &&
+        (savedChatUrl(job.provider, probe.url) !== job.chat_url || !probe.message_count)
+      )
+        throw new Diagnostic('CHAT_HISTORY_MISSING', 'The saved chat has no recognizable history');
       if (!probe.ready || !probe.signedIn)
         throw new Diagnostic(
           'PROVIDER_NOT_READY',
@@ -94,47 +145,32 @@ export class BrowserPlatform implements Platform {
         );
       return existing;
     }
-    const tabs = await chrome.tabs.query({ url: `${ORIGINS[job.provider]}/*` });
-    if (!tabs.some((t) => !t.incognito))
+    if (job.operation !== 'open') {
+      const prepared = await this.preparedTab(job);
+      if (prepared) return prepared;
+    }
+    const tabs = job.chat_url ? [] : await chrome.tabs.query({ url: `${ORIGINS[job.provider]}/*` });
+    if (
+      job.operation !== 'open' &&
+      !job.chat_url &&
+      !tabs.some(
+        (tab) => tab.id !== undefined && !tab.incognito && originProvider(tab.url) === job.provider,
+      )
+    )
       throw new Diagnostic(
         'MISSING_PROVIDER_TAB',
         'Open and sign in to the provider in this Chrome profile first',
       );
-    let signedIn: chrome.tabs.Tab | undefined;
-    const errors: string[] = [];
-    for (const tab of tabs) {
-      if (tab.id === undefined || tab.incognito || originProvider(tab.url) !== job.provider)
-        continue;
-      try {
-        const p = await this.probe(tab.id, config);
-        if (p.ready && p.signedIn) {
-          signedIn = tab;
-          break;
-        }
-        if (p.error) errors.push(p.error);
-      } catch {
-        errors.push(
-          'DOM_UNSUPPORTED: Reload the signed-in provider tab after installing the extension and check selectors',
-        );
-      }
-    }
-    if (!signedIn)
-      throw new Diagnostic(
-        'LOGIN_OR_DOM_REQUIRED',
-        errors[0] ??
-          'No tab has positive signed-in DOM evidence; check login and provider selectors',
-      );
+    // A source provider tab is the user's explicit profile context. Its content
+    // script may have become stale after an extension reload. Authenticate only
+    // in the fresh owned page below; never refresh or alter the user's chat.
     // Each conversation has an active tab in an owned window. Real providers may
     // defer rendering and event handling in inactive tabs; separate windows also
     // preserve parallelism without changing the user's existing active tabs.
     const workspace = await chrome.windows.create({
-      url: `${ORIGINS[job.provider]}/`,
+      url: job.chat_url ?? ORIGINS[job.provider] + catalog[job.provider].start,
       type: 'normal',
       focused: true,
-      width: 900,
-      height: 750,
-      left: job.provider === 'deepseek' ? 20 : 460,
-      top: 40,
     });
     const created = workspace?.tabs?.[0];
     if (!created || created.id === undefined || workspace?.id === undefined)
@@ -144,6 +180,13 @@ export class BrowserPlatform implements Platform {
       token = crypto.randomUUID();
     // Ownership is ephemeral across browser restarts, and durable across worker restarts.
     await chrome.storage.session.set({ [`tab:${id}`]: token });
+    const probe = await this.waitForConversation(job, config, id);
+    const conversation = { tabId: id, token, url: probe.url };
+    await store.set(`conversation:${key}`, conversation);
+    return conversation;
+  }
+
+  private async waitForConversation(job: Job, config: ProviderConfig, id: number): Promise<Probe> {
     const until = Date.now() + Math.min(job.timeout_ms, 20_000);
     let last = 'DOM_UNSUPPORTED: New tab did not become ready';
     while (Date.now() < until) {
@@ -156,31 +199,201 @@ export class BrowserPlatform implements Platform {
       try {
         const probe = await this.probe(id, config);
         if (probe.ready && probe.signedIn) {
-          if (new URL(probe.url).pathname !== '/')
+          if (job.chat_url) {
+            if (savedChatUrl(job.provider, probe.url) !== job.chat_url)
+              throw new Diagnostic('CHAT_URL_CHANGED', 'The saved chat redirected elsewhere');
+            if (!probe.message_count) {
+              last = 'CHAT_HISTORY_MISSING: The saved chat has no recognizable messages';
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              continue;
+            }
+          } else if (
+            !catalog[job.provider].home.includes(
+              new URL(probe.url).pathname.replace(/\/$/, '') || '/',
+            )
+          )
             throw new Diagnostic(
               'NEW_CHAT_NOT_EMPTY',
               'Provider restored a conversation URL; no prompt sent',
             );
-          if (probe.message_count || probe.draft)
+          if (!job.chat_url && probe.message_count)
             throw new Diagnostic(
               'NEW_CHAT_NOT_EMPTY',
-              'Provider opened an existing chat or draft; no prompt sent',
+              'Provider opened an existing chat; no prompt sent',
             );
-          const conversation = { tabId: id, token, url: probe.url };
-          await store.set(`conversation:${key}`, conversation);
-          return conversation;
+          return probe;
         }
         if (probe.error) last = probe.error;
         if (probe.error && /^(CAPTCHA|LOGIN_REQUIRED|QUOTA|PROVIDER_ERROR):/.test(probe.error))
           throw new Diagnostic('NEW_CHAT_BLOCKED', probe.error);
       } catch (e) {
-        if (e instanceof Diagnostic && ['NEW_CHAT_NOT_EMPTY', 'NEW_CHAT_BLOCKED'].includes(e.code))
+        if (
+          e instanceof Diagnostic &&
+          ['NEW_CHAT_NOT_EMPTY', 'NEW_CHAT_BLOCKED', 'CHAT_URL_CHANGED'].includes(e.code)
+        )
           throw e;
       }
       await new Promise((r) => setTimeout(r, 150));
     }
     throw new Diagnostic('NEW_CHAT_NOT_READY', last);
   }
+  private async rememberOpen(job: Job, conversation: Conversation): Promise<void> {
+    await chrome.storage.session.set({
+      [`prepared:${job.provider}`]: { tabId: conversation.tabId, url: conversation.url },
+    });
+  }
+
+  private async preparedTab(job: Job): Promise<Conversation | undefined> {
+    const key = `prepared:${job.provider}`;
+    const saved = (await chrome.storage.session.get(key))[key] as
+      Pick<Conversation, 'tabId' | 'url'> | undefined;
+    if (!saved) return;
+    const tab = await chrome.tabs.get(saved.tabId).catch(() => undefined);
+    if (!tab || tab.incognito || originProvider(tab.url) !== job.provider) return;
+    if (tab.url !== saved.url || tab.pendingUrl)
+      throw new Diagnostic('TAB_NAVIGATED', 'The prepared tab changed. Run open again.');
+    return { ...saved, prepared: true, token: crypto.randomUUID() };
+  }
+
+  private async usePreparedTab(
+    job: Job,
+    conversation: Conversation,
+    config: ProviderConfig,
+  ): Promise<void> {
+    const key = `prepared:${job.provider}`;
+    const saved = (await chrome.storage.session.get(key))[key] as
+      Pick<Conversation, 'tabId' | 'url'> | undefined;
+    const tab = await chrome.tabs.get(conversation.tabId);
+    if (
+      saved?.tabId !== conversation.tabId ||
+      tab.url !== conversation.url ||
+      tab.incognito ||
+      tab.pendingUrl
+    )
+      throw new Diagnostic('TAB_NAVIGATED', 'The prepared tab changed. Run open again.');
+    const until = Date.now() + Math.min(8_000, job.timeout_ms);
+    let probe = await this.probeExisting(job, conversation.tabId, config);
+    while (
+      (!probe.ready || !probe.signedIn) &&
+      probe.url === tab.url &&
+      Date.now() < until &&
+      !/^(LOGIN_REQUIRED|CAPTCHA|QUOTA|PROVIDER_ERROR):/.test(probe.error ?? '')
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      probe = await this.probe(conversation.tabId, config);
+    }
+    if (!probe.ready || !probe.signedIn || probe.url !== tab.url)
+      throw new Diagnostic(
+        'PROVIDER_NOT_READY',
+        probe?.error ?? 'Refresh or sign in to the prepared tab, then run open again',
+      );
+    if (probe.busy) throw new Diagnostic('TAB_BUSY', 'The prepared tab is generating a reply');
+    if (probe.draft && job.modes?.[REPLACE_DRAFT] !== true)
+      throw new Diagnostic(
+        'USER_DRAFT',
+        'The prepared tab contains an unsent draft; use --replace-draft to discard it',
+      );
+    const site = catalog[job.provider];
+    const currentPath = new URL(probe.url).pathname.replace(/\/$/, '') || '/';
+    const needsNavigation = job.chat_url
+      ? savedChatUrl(job.provider, probe.url) !== job.chat_url
+      : !site.home.includes(currentPath) || probe.message_count > 0;
+    if (job.chat_url && !needsNavigation && !probe.message_count)
+      throw new Diagnostic('CHAT_HISTORY_MISSING', 'The saved chat has no recognizable history');
+    if (needsNavigation) {
+      await chrome.tabs.update(conversation.tabId, {
+        url: job.chat_url ?? site.origin + site.start,
+        active: true,
+      });
+      conversation.url = (await this.waitForConversation(job, config, conversation.tabId)).url;
+    }
+    // Transfer only the chosen tab. Moving it between windows keeps the same tab ID.
+    await chrome.storage.session.set({
+      [`tab:${conversation.tabId}`]: conversation.token,
+      [key]: { tabId: conversation.tabId, url: conversation.url },
+    });
+    delete conversation.prepared;
+  }
+
+  private async existingView(job: Job): Promise<Conversation | undefined> {
+    const tabs = (await chrome.tabs.query({ url: `${ORIGINS[job.provider]}/*` }))
+      .filter(
+        (tab) =>
+          !tab.incognito &&
+          !tab.pendingUrl &&
+          tab.id !== undefined &&
+          originProvider(tab.url) === job.provider,
+      )
+      .sort(
+        (a, b) =>
+          Number(!!b.active) - Number(!!a.active) || (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0),
+      );
+    const exact =
+      job.chat_url && tabs.find((tab) => savedChatUrl(job.provider, tab.url!) === job.chat_url);
+    if (!tabs.length) return;
+    let tab = exact || undefined;
+    if (!tab) {
+      const keys = tabs.map((candidate) => `tab:${candidate.id}`);
+      const ownership = await chrome.storage.session.get(keys);
+      tab = tabs.find((candidate) => !ownership[`tab:${candidate.id}`]) ?? tabs[0]!;
+    }
+    return { tabId: tab.id!, url: tab.url!, token: '', view: true };
+  }
+
+  private async activateView(
+    job: Job,
+    conversation: Conversation,
+    config: ProviderConfig,
+  ): Promise<string> {
+    const { tabId, url } = conversation;
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.incognito || tab.pendingUrl || tab.url !== url)
+      throw new Diagnostic('TAB_NAVIGATED', 'The existing tab changed; run open again');
+
+    const navigate = job.chat_url && savedChatUrl(job.provider, url) !== job.chat_url;
+    if (navigate) {
+      const workKey = `tab:${tabId}`;
+      if ((await chrome.storage.session.get(workKey))[workKey])
+        throw new Diagnostic(
+          'TAB_BUSY',
+          'Open another tab of this provider to preserve its work session',
+        );
+      const probe = await this.probeExisting(job, tabId, config);
+      if (!probe?.ready || probe.url !== url)
+        throw new Diagnostic(
+          'PROVIDER_NOT_READY',
+          'Reload the provider tab manually before opening a different chat',
+        );
+      if (probe.draft) throw new Diagnostic('USER_DRAFT', 'The existing tab has an unsent draft');
+      if (probe.busy) throw new Diagnostic('TAB_BUSY', 'The existing tab is generating a reply');
+      const current = await chrome.tabs.get(tabId);
+      if (current.url !== url || current.pendingUrl)
+        throw new Diagnostic('TAB_NAVIGATED', 'The existing tab changed; run open again');
+    }
+
+    await chrome.tabs.update(
+      tabId,
+      navigate ? { url: job.chat_url, active: true } : { active: true },
+    );
+    const window = await chrome.windows.get(tab.windowId);
+    if (window.state === 'minimized')
+      await chrome.windows.update(tab.windowId, { state: 'normal' });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    if (!navigate) return url;
+
+    const until = Date.now() + Math.min(job.timeout_ms, 20_000);
+    while (Date.now() < until) {
+      const loaded = await chrome.tabs.get(tabId);
+      if (loaded.status === 'complete' && !loaded.pendingUrl) {
+        if (loaded.url && savedChatUrl(job.provider, loaded.url) === job.chat_url)
+          return loaded.url;
+        throw new Diagnostic('CHAT_URL_CHANGED', 'The saved chat redirected elsewhere');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    throw new Diagnostic('NEW_CHAT_NOT_READY', 'The saved chat did not finish loading');
+  }
+
   async authorize(
     message: unknown,
     sender: chrome.runtime.MessageSender,
@@ -215,12 +428,24 @@ export class BrowserPlatform implements Platform {
     conversation: Conversation,
     authorize: () => Promise<void>,
   ): Promise<Result> {
+    const config = settings.providers[job.provider];
+    if (conversation.view && job.operation === 'open') {
+      conversation.url = await this.activateView(job, conversation, config);
+      if (!Object.keys(job.modes ?? {}).length) {
+        await this.rememberOpen(job, conversation);
+        return result(job, 'completed', undefined, '', conversation.url);
+      }
+    }
+    const prepared = conversation.prepared === true;
+    if (prepared) await this.usePreparedTab(job, conversation, config);
     const tab = await chrome.tabs.get(conversation.tabId);
-    const owned = (await chrome.storage.session.get(`work-window:${tab.windowId}`))[
-      `work-window:${tab.windowId}`
-    ];
-    if (!owned)
-      throw new Diagnostic('WORKSPACE_REQUIRED', 'Use a new conversation in an owned work window');
+    const tabKey = `tab:${conversation.tabId}`;
+    const ownership = (await chrome.storage.session.get(tabKey))[tabKey];
+    if (ownership !== conversation.token && !(conversation.view && job.operation === 'open'))
+      throw new Diagnostic(
+        'WORKSPACE_REQUIRED',
+        'The tab is no longer assigned to this conversation',
+      );
     const window = await chrome.windows.get(tab.windowId);
     if (window.state === 'minimized')
       throw new Diagnostic(
@@ -228,8 +453,22 @@ export class BrowserPlatform implements Platform {
         'Restore the work window before running a new job',
       );
     if (!tab.active) await chrome.tabs.update(conversation.tabId, { active: true });
-    const config = settings.providers[job.provider],
-      probe = await this.probe(conversation.tabId, config);
+    if (job.operation !== 'open' && !window.focused)
+      await chrome.windows.update(tab.windowId, { focused: true });
+    const probeTab = () => this.probeExisting(job, conversation.tabId, config);
+    let probe = await probeTab();
+    if (job.operation !== 'open') {
+      const until = Date.now() + Math.min(2_000, job.timeout_ms);
+      while (probe.visible === false && Date.now() < until) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        probe = await probeTab();
+      }
+      if (probe.visible === false)
+        throw new Diagnostic(
+          'WORKSPACE_HIDDEN',
+          'Bring the provider tab to the foreground before asking',
+        );
+    }
     if (probe.url !== conversation.url)
       throw new Diagnostic('TAB_NAVIGATED', 'Conversation URL changed before submission');
     const nonce = crypto.randomUUID();
@@ -238,12 +477,21 @@ export class BrowserPlatform implements Platform {
       provider: job.provider,
       documentToken: probe.document_token,
       nonce,
-      authorize,
+      authorize: async () => {
+        if (prepared) {
+          const key = `prepared:${job.provider}`;
+          const saved = (await chrome.storage.session.get(key))[key] as
+            Pick<Conversation, 'tabId' | 'url'> | undefined;
+          if (saved?.tabId === conversation.tabId)
+            await chrome.storage.session.set({ [key]: null });
+        }
+        await authorize();
+      },
       authorized: false,
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([
+      const response = await Promise.race([
         chrome.tabs.sendMessage(
           conversation.tabId,
           { type: 'run', job, config, document_token: probe.document_token, nonce },
@@ -263,6 +511,11 @@ export class BrowserPlatform implements Platform {
           );
         }),
       ]);
+      if (job.operation === 'open' && response.status === 'completed') {
+        conversation.url = response.conversation_url;
+        await this.rememberOpen(job, conversation);
+      }
+      return response;
     } finally {
       if (timer) clearTimeout(timer);
       this.pending.delete(job.request_id);

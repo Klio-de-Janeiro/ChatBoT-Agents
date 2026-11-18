@@ -1,4 +1,6 @@
 import { isObject, PROVIDERS, type Provider } from './protocol';
+import { browserAdapters } from './provider-adapters';
+import { DEFAULT_MODE_REGISTRIES, parseModeRegistry, type ModeRegistry } from './mode-controls';
 export type Selectors = {
   composer: string[];
   send: string[];
@@ -13,11 +15,17 @@ export type Selectors = {
   quota: string[];
   error: string[];
 };
-export type ProviderConfig = { selectors: Selectors; stable_ms: number; poll_ms: number };
+export type ProviderConfig = {
+  selectors: Selectors;
+  stable_ms: number;
+  poll_ms: number;
+  modes?: ModeRegistry;
+};
 export type Settings = { enabled: Provider[]; providers: Record<Provider, ProviderConfig> };
 // Conservative candidates. Site releases may require selector updates; no wildcard assistant fallback.
-const LEGACY_SETTINGS: Settings = {
-  enabled: [],
+type LegacyProvider = 'deepseek' | 'qwen';
+const legacyProviders = ['deepseek', 'qwen'] as const;
+const LEGACY_SETTINGS: { providers: Record<LegacyProvider, ProviderConfig> } = {
   providers: {
     deepseek: {
       stable_ms: 1200,
@@ -90,12 +98,15 @@ const LEGACY_SETTINGS: Settings = {
   },
 };
 // Confirmed against the signed-in web interfaces, 2026-11-17.
-export const DEFAULT_SETTINGS: Settings = structuredClone(LEGACY_SETTINGS);
-const liveSelectors: Record<Provider, Partial<Selectors>> = {
+export const DEFAULT_SETTINGS: Settings = {
+  enabled: [],
+  providers: { ...structuredClone(LEGACY_SETTINGS.providers), ...browserAdapters },
+};
+const liveSelectors: Record<LegacyProvider, Partial<Selectors>> = {
   deepseek: {
     send: ['div[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)'],
     user: ['.ds-message.d29f3d7d'],
-    assistant: ['.ds-message:not(.d29f3d7d)'],
+    assistant: ['.ds-message:not(.d29f3d7d):has(.ds-assistant-message-main-content)'],
     text: ['.ds-assistant-message-main-content', '.fbb737a4'],
     generating: ['.ds-button--circle svg[data-icon="spin"]'],
     complete: [
@@ -110,11 +121,12 @@ const liveSelectors: Record<Provider, Partial<Selectors>> = {
     assistant: ['.qwen-chat-message-assistant'],
     text: ['.user-message-content', '.response-message-content .qwen-markdown'],
     complete: ['.qwen-chat-package-comp-new-action-control-container-copy'],
-    signedIn: ['button.user-menu-btn'],
+    signedIn: ['button.user-menu-btn', 'button.user-menu-btn-mobile'],
     error: ['.qwen-chat-message-dual-message'],
   },
 };
-for (const provider of PROVIDERS) {
+for (const provider of legacyProviders) {
+  DEFAULT_SETTINGS.providers[provider].modes = structuredClone(DEFAULT_MODE_REGISTRIES[provider]);
   for (const field of Object.keys(liveSelectors[provider]) as (keyof Selectors)[]) {
     DEFAULT_SETTINGS.providers[provider].selectors[field].push(...liveSelectors[provider][field]!);
   }
@@ -122,7 +134,8 @@ for (const provider of PROVIDERS) {
 
 export function migrateLegacySelectors(settings: Settings): Settings {
   const updated = structuredClone(settings);
-  for (const provider of PROVIDERS) {
+  for (const provider of legacyProviders) {
+    updated.providers[provider].modes ??= structuredClone(DEFAULT_MODE_REGISTRIES[provider]);
     for (const field of Object.keys(liveSelectors[provider]) as (keyof Selectors)[]) {
       if (
         JSON.stringify(settings.providers[provider].selectors[field]) ===
@@ -133,6 +146,46 @@ export function migrateLegacySelectors(settings: Settings): Settings {
         ];
       }
     }
+  }
+  // Earlier defaults treated DeepSeek's temporary user bubble as an assistant.
+  const oldDeepSeekAssistant = [
+    ...LEGACY_SETTINGS.providers.deepseek.selectors.assistant,
+    '.ds-message:not(.d29f3d7d)',
+  ];
+  if (
+    JSON.stringify(settings.providers.deepseek.selectors.assistant) ===
+    JSON.stringify(oldDeepSeekAssistant)
+  ) {
+    updated.providers.deepseek.selectors.assistant = [
+      ...DEFAULT_SETTINGS.providers.deepseek.selectors.assistant,
+    ];
+  }
+  // Qwen swaps its account button in the responsive layout. Only upgrade the
+  // exact prior default; a locally customized authentication rule is preserved.
+  const previousQwenAuth = DEFAULT_SETTINGS.providers.qwen.selectors.signedIn.filter(
+    (selector) => selector !== 'button.user-menu-btn-mobile',
+  );
+  if (
+    JSON.stringify(settings.providers.qwen.selectors.signedIn) === JSON.stringify(previousQwenAuth)
+  ) {
+    updated.providers.qwen.selectors.signedIn = [
+      ...DEFAULT_SETTINGS.providers.qwen.selectors.signedIn,
+    ];
+  }
+  // 0.2.0 only matched native buttons, but Qwen renders its tool trigger as
+  // div[role=button]. Upgrade the unchanged control without replacing edits.
+  const defaultSearch = DEFAULT_MODE_REGISTRIES.qwen.controls.search;
+  if (defaultSearch?.kind === 'search-chip') {
+    const priorSearch = structuredClone(defaultSearch);
+    priorSearch.trigger.selector = ['button'];
+    const savedSearch = updated.providers.qwen.modes!.controls.search;
+    if (JSON.stringify(savedSearch) === JSON.stringify(priorSearch)) {
+      updated.providers.qwen.modes!.controls.search = structuredClone(defaultSearch);
+    }
+  }
+  const kimiText = updated.providers.kimi.selectors.text;
+  if (JSON.stringify(kimiText) === JSON.stringify(['.segment-content', '.markdown'])) {
+    updated.providers.kimi.selectors.text = [...DEFAULT_SETTINGS.providers.kimi.selectors.text];
   }
   return updated;
 }
@@ -162,10 +215,11 @@ function validateProvider(provider: Provider, value: unknown): void {
       throw new Error(`Invalid selectors: ${provider}.${field}`);
   }
   if (
-    !onlyKeys(value, ['selectors', 'stable_ms', 'poll_ms']) ||
+    !onlyKeys(value, ['selectors', 'stable_ms', 'poll_ms', 'modes']) ||
     !onlyKeys(value.selectors, selectorFields)
   )
     throw new Error(`Unexpected config key: ${provider}`);
+  if (value.modes !== undefined) parseModeRegistry(value.modes);
 }
 export function parseSettings(value: unknown): Settings {
   if (!isObject(value) || !Array.isArray(value.enabled) || !isObject(value.providers))
@@ -174,6 +228,7 @@ export function parseSettings(value: unknown): Settings {
     throw new Error('Invalid enabled provider');
   if (!onlyKeys(value, ['enabled', 'providers']) || !onlyKeys(value.providers, PROVIDERS))
     throw new Error('Origins and extra config keys cannot be changed');
-  for (const provider of PROVIDERS) validateProvider(provider, value.providers[provider]);
-  return value as Settings;
+  const providers = { ...structuredClone(DEFAULT_SETTINGS.providers), ...value.providers };
+  for (const provider of PROVIDERS) validateProvider(provider, providers[provider]);
+  return { enabled: value.enabled as Provider[], providers: providers as Settings['providers'] };
 }

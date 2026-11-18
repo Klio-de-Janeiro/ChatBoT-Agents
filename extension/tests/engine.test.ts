@@ -169,3 +169,41 @@ test('content failures after persisted sent never permit a new turn', async () =
   assert.equal(h.results[0]!.status, 'unknown');
   assert.match(h.results[1]!.error!, /QUARANTINED/);
 });
+test('fingerprints include operation and sorted modes, with legacy default tombstone compatibility', async () => {
+  const h = harness(),
+    j = makeJob({ modes: { think: true, search: false } });
+  await h.engine.accept(j);
+  await h.engine.accept({ ...j, operation: 'ask', modes: { search: false, think: true } });
+  assert.equal(h.calls, 1);
+  assert.equal(h.results.at(-1)!.status, 'completed');
+  await h.engine.accept({ ...j, operation: 'open' });
+  assert.match(h.results.at(-1)!.error!, /REQUEST_ID_CONFLICT/);
+  await h.engine.accept({ ...j, modes: { think: false, search: false } });
+  assert.match(h.results.at(-1)!.error!, /REQUEST_ID_CONFLICT/);
+  const legacy = harness(),
+    old = makeJob();
+  await legacy.store.set(`request:${old.request_id}`, {
+    phase: 'final',
+    fingerprint: await digest([old.provider, old.prompt, old.conversation_key, old.timeout_ms]),
+    conversation: 'old',
+    provider: old.provider,
+    result: result(old, 'completed', undefined, 'cached', 'https://chat.deepseek.com/'),
+  });
+  await legacy.engine.accept({ ...old, operation: 'ask', modes: {} });
+  assert.equal(legacy.calls, 0);
+  assert.equal(legacy.results[0]!.text, 'cached');
+  await legacy.engine.accept({ ...old, operation: 'open' });
+  assert.match(legacy.results.at(-1)!.error!, /REQUEST_ID_CONFLICT/);
+});
+test('open completion with empty text persists without marking prompt sent', async () => {
+  const h = harness();
+  h.store.fail = (_key, value) => (value as RecordState)?.phase === 'sent';
+  h.platform.run = async (job, _s, c, _authorize) => {
+    assert.equal(job.operation, 'open');
+    return result(job, 'completed', undefined, '', c.url);
+  };
+  const j = makeJob({ operation: 'open' });
+  await h.engine.accept(j);
+  assert.equal(h.results[0]!.status, 'completed');
+  assert.equal((await h.store.get<RecordState>(`request:${j.request_id}`))!.phase, 'final');
+});

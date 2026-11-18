@@ -1,5 +1,16 @@
-import { Diagnostic, MAX_RESULT_BYTES, utf8Bytes, result, type Job, type Result } from './protocol';
+import {
+  catalog,
+  Diagnostic,
+  MAX_RESULT_BYTES,
+  utf8Bytes,
+  result,
+  REPLACE_DRAFT,
+  savedChatUrl,
+  type Job,
+  type Result,
+} from './protocol';
 import type { ProviderConfig } from './config';
+import { applyRequestedModes } from './modes';
 
 export const normalize = (s: string) =>
   s
@@ -64,12 +75,32 @@ export class DomAdapter {
   probe(): Probe {
     const error = this.diagnostic();
     const composer = this.first(this.config.selectors.composer);
+    // Account/history evidence can be collapsed by the provider's responsive
+    // sidebar. It is positive authenticated DOM evidence even without layout;
+    // the composer must remain visible, and visible login/challenges win.
+    const authenticated = !!this.doc.querySelector(this.config.selectors.signedIn.join(','));
     return {
       ready: !error && !!composer,
-      signedIn: !error && !!composer && !!this.first(this.config.selectors.signedIn),
-      error: error?.message,
+      signedIn: !error && !!composer && authenticated,
+      error:
+        error?.message ??
+        (!composer
+          ? 'DOM_UNSUPPORTED: Visible composer is missing'
+          : !authenticated
+            ? 'AUTH_EVIDENCE_MISSING: Composer is visible but no account/history evidence was found'
+            : undefined),
       url: this.doc.location.href,
     };
+  }
+  // A provider may show a reply before updating its history or redirecting.
+  private hasSavedThread(provider: Job['provider']): boolean {
+    const prefix = catalog[provider].thread;
+    if (!prefix) return true;
+    const { origin, pathname } = this.doc.location;
+    if (!pathname.startsWith(prefix) || pathname.length <= prefix.length) return false;
+    return [...this.doc.querySelectorAll<HTMLAnchorElement>('a[href]')].some((link) => {
+      return link.origin === origin && link.pathname === pathname;
+    });
   }
   messages(): Element[] {
     return this.all([...this.config.selectors.user, ...this.config.selectors.assistant]);
@@ -108,7 +139,8 @@ export class DomAdapter {
       range.selectNodeContents(e);
       selection?.removeAllRanges();
       selection?.addRange(range);
-      if (!this.doc.execCommand('insertText', false, value)) e.textContent = value;
+      if (this.doc.execCommand(value ? 'insertText' : 'delete', false, value)) return;
+      e.textContent = value;
     } else throw new Diagnostic('COMPOSER_UNSUPPORTED', 'Configured composer is not editable');
     e.dispatchEvent(
       new view.InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }),
@@ -118,12 +150,14 @@ export class DomAdapter {
   async run(job: Job, authorize: () => Promise<void>): Promise<Result> {
     const start = Date.now(),
       deadline = start + job.timeout_ms;
+    let clicked = false;
+    let written: Element | undefined;
     let sent = false,
       partialText = '',
       observer: MutationObserver | undefined,
       timer: ReturnType<typeof setTimeout> | undefined;
     const progress = {
-      revision: 'live-dom-3',
+      revision: 'live-dom-4',
       phase: 'prepare',
       userSeen: false,
       assistantSeen: false,
@@ -150,10 +184,18 @@ export class DomAdapter {
         });
         timer = setTimeout(wake, this.config.poll_ms);
       });
+    const onTargetChat = () =>
+      !job.chat_url || savedChatUrl(job.provider, this.doc.location.href) === job.chat_url;
     try {
       const problem = this.diagnostic();
       if (problem) throw problem;
-      const composer = this.first(this.config.selectors.composer);
+      const { [REPLACE_DRAFT]: replaceDraft, ...providerModes } = job.modes ?? {};
+      if (
+        replaceDraft !== undefined &&
+        (job.operation === 'open' || typeof replaceDraft !== 'boolean')
+      )
+        throw new Diagnostic('MODE_VALUE_UNSUPPORTED', 'Draft replacement requires ask and on/off');
+      let composer = this.first(this.config.selectors.composer);
       if (!composer || !this.probe().signedIn)
         throw new Diagnostic(
           'DOM_UNSUPPORTED',
@@ -161,8 +203,27 @@ export class DomAdapter {
         );
       if (this.first(this.config.selectors.generating))
         throw new Diagnostic('TAB_BUSY', 'Provider is already generating');
-      if (normalize(this.value(composer)))
-        throw new Diagnostic('USER_DRAFT', 'Dedicated tab contains an unsent draft');
+      await applyRequestedModes(this, job.provider, providerModes, deadline);
+      if (!onTargetChat())
+        throw new Diagnostic('CHAT_URL_CHANGED', 'The saved chat changed before submission');
+      if (job.operation === 'open') {
+        const problem = this.diagnostic();
+        if (problem) throw problem;
+        if (!this.probe().signedIn)
+          throw new Diagnostic(
+            'PROVIDER_NOT_READY',
+            'Authenticated UI was lost while applying modes',
+          );
+        return result(job, 'completed', undefined, '', this.doc.location.href);
+      }
+      composer = this.first(this.config.selectors.composer);
+      if (!composer)
+        throw new Diagnostic('DOM_UNSUPPORTED', 'Composer disappeared before submission');
+      if (normalize(this.value(composer)) && replaceDraft !== true)
+        throw new Diagnostic(
+          'USER_DRAFT',
+          'The tab contains an unsent draft; use --replace-draft to discard it',
+        );
       const baseline = this.messages();
       const baselineText = baseline.map((e) => this.text(e));
       const baselineIds = baseline.map((e) => this.identity(e));
@@ -170,9 +231,22 @@ export class DomAdapter {
       let user: Element | undefined, assistant: Element | undefined;
       let userIdentity: string | Element | undefined;
       let assistantIdentity: string | Element | undefined;
+      let mismatchSince: number | undefined;
+      const virtualKey = (element: Element | undefined): number | undefined => {
+        if (job.provider !== 'deepseek' || !element?.matches('.ds-message')) return;
+        const key = element
+          .closest('[data-virtual-list-item-key]')
+          ?.getAttribute('data-virtual-list-item-key');
+        if (key && /^-?\d+$/.test(key)) return Number(key);
+      };
       this.setValue(composer, job.prompt);
-      if (normalize(this.value(composer)) !== normalize(job.prompt))
-        throw new Diagnostic('COMPOSER_MISMATCH', 'Composer did not retain the exact prompt');
+      if (normalize(this.value(composer)) !== normalize(job.prompt)) {
+        await pause();
+        composer = this.first(this.config.selectors.composer) ?? composer;
+        if (normalize(this.value(composer)) !== normalize(job.prompt))
+          throw new Diagnostic('COMPOSER_MISMATCH', 'Composer did not retain the exact prompt');
+      }
+      written = composer;
       let send: Element | undefined;
       while (Date.now() < deadline) {
         const d = this.diagnostic();
@@ -193,6 +267,7 @@ export class DomAdapter {
       if (Date.now() >= deadline)
         throw new Diagnostic('DEADLINE', 'Deadline expired before click', 'timeout');
       if (
+        !onTargetChat() ||
         this.messages().length !== baseline.length ||
         this.messages().some(
           (e, i) => this.identity(e) !== baselineIds[i] || this.text(e) !== baselineText[i],
@@ -217,6 +292,7 @@ export class DomAdapter {
           'SEND_CONTROL_CHANGED',
           'Send control changed before click; no click performed',
         );
+      clicked = true;
       (send as HTMLElement).click();
       progress.phase = 'await_user_echo';
       let lastText = '',
@@ -240,46 +316,97 @@ export class DomAdapter {
           throw new Diagnostic('IDENTITY_COLLISION', 'Message identities are ambiguous', 'unknown');
         const fresh = messages.filter((e) => !baselineSet.has(this.identity(e)));
         if (!user && fresh.length) {
-          if (!this.isUser(fresh[0]!) || this.text(fresh[0]!) !== normalize(job.prompt))
+          const candidate = fresh[0]!;
+          if (!this.isUser(candidate) || this.text(candidate) !== normalize(job.prompt)) {
+            const kimiPending =
+              job.provider === 'kimi' &&
+              (!this.isUser(candidate) || !candidate.querySelector('.user-content__text'));
+            if (virtualKey(candidate) !== undefined || kimiPending) {
+              // Wait briefly for a provider to mount the role and its text.
+              mismatchSince ??= Date.now();
+              if (Date.now() - mismatchSince < 600) {
+                await pause();
+                continue;
+              }
+            }
             throw new Diagnostic(
               'PROMPT_CORRELATION',
               'New user message does not match this request',
               'unknown',
             );
-          user = fresh[0];
-          userIdentity = this.identity(user!);
+          }
+          user = candidate;
+          userIdentity = this.identity(candidate);
           progress.userSeen = true;
           progress.phase = 'await_assistant';
         }
         if (user) {
-          if (
-            !fresh[0] ||
-            this.identity(fresh[0]) !== userIdentity ||
-            this.text(fresh[0]) !== normalize(job.prompt)
-          )
+          const first = fresh[0];
+          const verifiedUserKey = virtualKey(user);
+          let answer: Element | undefined;
+          if (first && this.isUser(first)) {
+            const currentUserKey = virtualKey(first);
+            const reconciled =
+              verifiedUserKey !== undefined &&
+              verifiedUserKey < 0 &&
+              currentUserKey !== undefined &&
+              currentUserKey > 0;
+            const identity = this.identity(first);
+            if (
+              (!reconciled && identity !== userIdentity) ||
+              this.text(first) !== normalize(job.prompt)
+            )
+              throw new Diagnostic('PROMPT_CHANGED', 'Captured prompt changed', 'unknown');
+            user = first;
+            userIdentity = identity;
+            answer = fresh[1];
+          } else if (verifiedUserKey !== undefined) {
+            // A long reply can scroll the positively identified user turn out of
+            // the DOM. Correlate only its already tracked or adjacent assistant.
+            if (!first) {
+              await pause();
+              continue;
+            }
+            if (fresh.length > 1)
+              throw new Diagnostic(
+                'TAB_INTERFERENCE',
+                'Unexpected extra turn in dedicated tab',
+                'unknown',
+              );
+            const firstKey = virtualKey(first);
+            if (
+              (assistantIdentity !== undefined && this.identity(first) === assistantIdentity) ||
+              (verifiedUserKey > 0 && firstKey === verifiedUserKey + 1)
+            )
+              answer = first;
+            else {
+              await pause();
+              continue;
+            }
+          } else {
             throw new Diagnostic('PROMPT_CHANGED', 'Captured prompt changed', 'unknown');
-          user = fresh[0];
-          if (fresh.length > 2 || (fresh[1] && this.isUser(fresh[1])))
+          }
+          if (fresh.length > (first === answer ? 1 : 2) || (answer && this.isUser(answer)))
             throw new Diagnostic(
               'TAB_INTERFERENCE',
               'Unexpected extra turn in dedicated tab',
               'unknown',
             );
-          if (!assistant && fresh[1]) {
-            assistant = fresh[1];
-            assistantIdentity = this.identity(assistant);
+          if (!assistant && answer) {
+            assistant = answer;
+            assistantIdentity = this.identity(answer);
           }
           if (assistant) {
             progress.assistantSeen = true;
             progress.phase = 'await_completion';
-            if (!fresh[1] || this.identity(fresh[1]) !== assistantIdentity)
+            if (!answer || this.identity(answer) !== assistantIdentity)
               throw new Diagnostic(
                 'ANSWER_CHANGED',
                 'Captured assistant message was replaced',
                 'unknown',
               );
-            if (fresh[1] !== assistant) stableSince = Date.now();
-            assistant = fresh[1];
+            if (answer !== assistant) stableSince = Date.now();
+            assistant = answer;
             const text = this.text(assistant);
             partialText = text;
             if (text !== lastText) {
@@ -292,6 +419,7 @@ export class DomAdapter {
             progress.complete = complete;
             progress.generating = !!this.first(this.config.selectors.generating);
             if (
+              (job.chat_url ? onTargetChat() : this.hasSavedThread(job.provider)) &&
               text &&
               complete &&
               !progress.generating &&
@@ -343,6 +471,18 @@ export class DomAdapter {
         this.doc.location.href,
       );
     } finally {
+      // Only undo an exact unsent draft this run wrote. A changed or sent draft is left alone.
+      if (
+        !clicked &&
+        written?.isConnected &&
+        normalize(this.value(written)) === normalize(job.prompt)
+      ) {
+        try {
+          this.setValue(written, '');
+        } catch {
+          /* Provider removed its editable control. */
+        }
+      }
       observer?.disconnect();
       if (timer) clearTimeout(timer);
     }
