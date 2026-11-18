@@ -59,6 +59,7 @@ _APP_CODES = frozenset(
         "WORKSPACE_HIDDEN",
         "CONTENT_SCRIPT_UNAVAILABLE",
         "CONTENT_TIMEOUT",
+        "ANSWER_COPY_FAILED",
     }
 )
 

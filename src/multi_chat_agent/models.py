@@ -158,11 +158,45 @@ class CellDocument(StrictModel):
     cells: list[Cell] = Field(min_length=1, max_length=10000)
 
 
+ANSWER_BLOCKS = frozenset(
+    {"heading", "paragraph", "list", "quote", "table", "code", "math", "image", "rule"}
+)
+
+
+class AnswerBlock(BaseModel):
+    """One provider-rendered block; extra keys are forward-compatible."""
+
+    model_config = ConfigDict(extra="allow")
+    type: str = Field(min_length=1, max_length=32)
+    text: str | None = None
+    markdown: str | None = None
+    latex: str | None = None
+    src: str | None = None
+
+    @field_validator("type")
+    @classmethod
+    def known_type(cls, value: str) -> str:
+        if value not in ANSWER_BLOCKS:
+            raise ValueError("unsupported answer block type")
+        return value
+
+
+class AnswerContent(BaseModel):
+    """Structured answer as the provider rendered it, next to the raw text."""
+
+    model_config = ConfigDict(extra="allow")
+    plain: str = ""
+    blocks: list[AnswerBlock] = Field(default_factory=list, max_length=100_000)
+
+
 class NativeResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
     type: Literal["result"]
     request_id: str = Field(min_length=1, max_length=80)
     status: ResultStatus
     text: str = ""
+    # Added in 0.3.0 and optional for compatibility with older extensions.
+    markdown: str | None = None
+    content: AnswerContent | None = None
     conversation_url: str | None = None
     error: str | None = None

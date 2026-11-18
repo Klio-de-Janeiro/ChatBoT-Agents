@@ -11,7 +11,14 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .assembler import CELL_INSTRUCTION, author_document, parse_cells, write_answer, write_artifact
+from .assembler import (
+    CELL_INSTRUCTION,
+    author_document,
+    markdown_answer,
+    parse_cells,
+    write_answer,
+    write_artifact,
+)
 from .errors import AgentError
 from .files import atomic_text
 from .models import OPEN_PROMPT, TERMINAL, Plan
@@ -25,6 +32,14 @@ def read_response(job: dict[str, Any]) -> str:
     if not job["result_path"]:
         raise AgentError("response_missing", "completed response file is missing")
     return Path(job["result_path"]).read_text(encoding="utf-8")
+
+
+def native_markdown(job: dict[str, Any]) -> Path | None:
+    """Provider-native Markdown copy of a completed answer, when captured."""
+    path = job.get("markdown_path")
+    if not path or not Path(path).is_file():
+        return None
+    return Path(path)
 
 
 def dependency_prompt(prompt: str, dependencies: list[tuple[str, str]]) -> str:
@@ -121,15 +136,44 @@ class Scheduler:
             legacy_path = self.store.task_dir(task_id) / "answer.txt"
             if plan.output.format == "markdown" and destination == legacy_path:
                 destination = raw
-            if destination != raw:
-                text = read_response(job)
-                try:
-                    write_answer(text, destination, plan.output.format)
-                except OSError as error:
-                    raise AgentError(
-                        "output_write_failed", "could not save the output file"
-                    ) from error
-            self.store.set_task(task_id, "completed", output_path=str(destination))
+            # The answer as the provider copied it. When the requested artifact
+            # is Markdown, it is published verbatim, so tables, fences and
+            # formulas keep their shape instead of the flattened plain text.
+            markdown_path = native_markdown(job)
+            published_markdown: Path | None = None
+            try:
+                if destination != raw:
+                    if plan.output.format in {"md", "markdown"} and markdown_path is not None:
+                        markdown_answer(
+                            markdown_path.read_text(encoding="utf-8"), destination, "markdown"
+                        )
+                    else:
+                        write_answer(read_response(job), destination, plan.output.format)
+            except OSError as error:
+                raise AgentError("output_write_failed", "could not save the output file") from error
+            if markdown_path is not None:
+                if destination.suffix.lower() == ".md":
+                    published_markdown = destination
+                else:
+                    # Other formats keep their artifact; the exact Markdown is
+                    # published next to it as `<name>.md`.
+                    published_markdown = destination.with_name(destination.stem + ".md")
+                    try:
+                        markdown_answer(
+                            markdown_path.read_text(encoding="utf-8"),
+                            published_markdown,
+                            "markdown",
+                        )
+                    except OSError as error:
+                        raise AgentError(
+                            "output_write_failed", "could not save the output file"
+                        ) from error
+            self.store.set_task(
+                task_id,
+                "completed",
+                output_path=str(destination),
+                markdown_path=str(published_markdown) if published_markdown else None,
+            )
             return
         outputs = [(job.id, read_response(jobs[job.id])) for job in plan.jobs]
         if plan.editor:

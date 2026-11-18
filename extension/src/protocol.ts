@@ -8,6 +8,9 @@ export const ORIGINS = Object.fromEntries(
 export const MAX_PROMPT_BYTES = 900 * 1024;
 export const MAX_JOB_BYTES = 1024 * 1024;
 export const MAX_RESULT_BYTES = 8 * 1024 * 1024;
+/** Provider-native Markdown copy bound; keeps the native frame within Chrome's limit. */
+export const MAX_MARKDOWN_BYTES = 4 * 1024 * 1024;
+export const MAX_CONTENT_BYTES = 2 * 1024 * 1024;
 export const utf8Bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 export type Modes = Record<string, boolean | string>;
 export const REPLACE_DRAFT = 'replace-draft';
@@ -30,11 +33,33 @@ export type Result = {
   request_id: string;
   status: Status;
   text: string;
+  /** Answer in the provider's own Markdown ("copy answer" on the site). */
+  markdown?: string;
+  /** Structured answer blocks; see answers.ts. Never required. */
+  content?: unknown;
   conversation_url: string;
   error?: string;
 };
 export const isObject = (x: unknown): x is Record<string, unknown> =>
   !!x && typeof x === 'object' && !Array.isArray(x);
+/**
+ * Structural check for `content` (see answers.ts). Renderers rely on it before
+ * walking blocks, so malformed payloads never leave the content script.
+ */
+export function validAnswerContent(value: unknown): boolean {
+  if (!isObject(value)) return false;
+  if (
+    value.version !== undefined &&
+    (!Number.isInteger(value.version) || (value.version as number) < 1)
+  )
+    return false;
+  if (value.plain !== undefined && typeof value.plain !== 'string') return false;
+  if (value.blocks === undefined) return true;
+  if (!Array.isArray(value.blocks) || value.blocks.length > 100_000) return false;
+  return value.blocks.every(
+    (block) => isObject(block) && typeof block.type === 'string' && block.type.length <= 32,
+  );
+}
 export const validId = (x: unknown): x is string =>
   typeof x === 'string' &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(x);
@@ -125,6 +150,7 @@ export function result(
   error?: string,
   text = '',
   url = '',
+  capture?: { markdown?: string; content?: unknown },
 ): Result {
   return {
     type: 'result',
@@ -132,6 +158,8 @@ export function result(
     status,
     text,
     conversation_url: url,
+    ...(capture?.markdown ? { markdown: capture.markdown } : {}),
+    ...(capture?.content ? { content: capture.content } : {}),
     ...(error ? { error } : {}),
   };
 }
@@ -152,7 +180,19 @@ export function validResult(value: unknown, job: Job): value is Result {
     return false;
   const validError =
     value.error === undefined || (typeof value.error === 'string' && value.error.length <= 1000);
-  return validError && utf8Bytes(JSON.stringify(value)) <= MAX_RESULT_BYTES;
+  const validMarkdown =
+    value.markdown === undefined ||
+    (typeof value.markdown === 'string' && utf8Bytes(value.markdown) <= MAX_MARKDOWN_BYTES);
+  const validContent =
+    value.content === undefined ||
+    (validAnswerContent(value.content) &&
+      utf8Bytes(JSON.stringify(value.content)) <= MAX_CONTENT_BYTES);
+  return (
+    validError &&
+    validMarkdown &&
+    validContent &&
+    utf8Bytes(JSON.stringify(value)) <= MAX_RESULT_BYTES
+  );
 }
 export class Diagnostic extends Error {
   constructor(
