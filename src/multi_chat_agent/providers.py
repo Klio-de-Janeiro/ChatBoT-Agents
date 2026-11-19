@@ -56,6 +56,8 @@ def saved_chat_url(provider: str, value: str) -> str | None:
     if len(value) > 512 or not trusted_url(provider, value):
         return None
     path = urlsplit(value).path.rstrip("/")
+    if (path or "/") in _CATALOG[provider]["home"]:
+        return None
     for prefix in _CATALOG[provider]["resume_paths"]:
         if path.startswith(prefix) and re.fullmatch(r"[A-Za-z0-9_-]+", path[len(prefix) :]):
             return _CATALOG[provider]["origin"] + path

@@ -1,8 +1,7 @@
 """Clipboard hand-off for provider-formatted answers.
 
-The answer is piped through the platform's clipboard utility, so the exact
-bytes the provider produced arrive in the clipboard unchanged (no shell
-quoting, no text re-encoding). No utility is bundled or installed: when none
+The answer is piped through the platform's clipboard utility without shell
+quoting. No utility is bundled or installed: when none
 is present the caller gets a structured `clipboard_unavailable` error and the
 already saved files remain the copy source.
 """
@@ -12,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 
 from .errors import AgentError
 
@@ -28,7 +28,7 @@ _LINUX = [
 def candidates() -> list[tuple[str, list[str]]]:
     if os.name == "nt":
         return _WINDOWS
-    if os.uname().sysname == "Darwin":
+    if sys.platform == "darwin":
         return _MACOS
     return _LINUX
 
@@ -39,10 +39,13 @@ def copy_text(text: str) -> str:
         executable = shutil.which(name)
         if executable is None:
             continue
+        # clip.exe recognizes UTF-16 with its BOM. Unmarked UTF-8 is decoded
+        # with the local code page and corrupts Cyrillic and other Unicode.
+        data = text.encode("utf-16") if name == "clip" else text.encode("utf-8")
         try:
             completed = subprocess.run(
                 [executable, *arguments],
-                input=text.encode("utf-8"),
+                input=data,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,

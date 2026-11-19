@@ -187,6 +187,19 @@ export function migrateLegacySelectors(settings: Settings): Settings {
   if (JSON.stringify(kimiText) === JSON.stringify(['.segment-content', '.markdown'])) {
     updated.providers.kimi.selectors.text = [...DEFAULT_SETTINGS.providers.kimi.selectors.text];
   }
+  const previousPerplexityAuth = [
+    'a[href="/library"]',
+    'button[aria-label="Поиск по сессиям"]',
+    'button[aria-label="Search sessions"]',
+  ];
+  if (
+    JSON.stringify(settings.providers.perplexity.selectors.signedIn) ===
+    JSON.stringify(previousPerplexityAuth)
+  ) {
+    updated.providers.perplexity.selectors.signedIn = [
+      ...DEFAULT_SETTINGS.providers.perplexity.selectors.signedIn,
+    ];
+  }
   return updated;
 }
 

@@ -20,7 +20,8 @@
     "origin": "https://chat.qwen.ai",
     "start": "/",
     "home": [
-      "/"
+      "/",
+      "/c/new-chat"
     ],
     "thread": null,
     "modes": [

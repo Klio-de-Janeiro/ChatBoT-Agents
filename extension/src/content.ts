@@ -11,7 +11,7 @@ if (context.mcaContentVersion !== version) {
 
 function registerContentScript(): void {
   const documentToken = crypto.randomUUID();
-  let busy = false;
+  let active: { adapter: DomAdapter; nonce: string } | undefined;
   const ownSender = (sender: chrome.runtime.MessageSender) =>
     sender.id === chrome.runtime.id &&
     (!sender.url || sender.url.startsWith(chrome.runtime.getURL('')));
@@ -19,24 +19,38 @@ function registerContentScript(): void {
     if (
       !ownSender(sender) ||
       !isObject(message) ||
-      !['probe', 'run'].includes(String(message.type))
+      !['probe', 'run', 'new-chat', 'poll'].includes(String(message.type))
     )
       return;
     const provider = originProvider(location.href);
     if (!provider) return;
+    if (message.type === 'poll') {
+      if (active && message.nonce === active.nonce && message.document_token === documentToken)
+        active.adapter.poll();
+      respond();
+      return;
+    }
     try {
       // Reuse strict config parser; content scripts do not read extension storage.
       const settings = structuredClone(DEFAULT_SETTINGS);
       settings.providers[provider] = message.config as ProviderConfig;
       const config = parseSettings(settings).providers[provider];
       const adapter = new DomAdapter(document, config);
+      if (message.type === 'new-chat') {
+        respond(
+          !active &&
+            message.document_token === documentToken &&
+            message.url === location.href &&
+            adapter.startNewChat(provider),
+        );
+        return;
+      }
       if (message.type === 'probe') {
         respond({
           ...adapter.probe(),
           document_token: documentToken,
           message_count: adapter.messages().length,
-          visible: document.visibilityState === 'visible',
-          busy: busy || !!adapter.first(config.selectors.generating),
+          busy: !!active || !!adapter.first(config.selectors.generating),
           draft:
             !!adapter.first(config.selectors.composer) &&
             !!adapter.value(adapter.first(config.selectors.composer)!).trim(),
@@ -48,12 +62,12 @@ function registerContentScript(): void {
         job.provider !== provider ||
         message.document_token !== documentToken ||
         typeof message.nonce !== 'string' ||
-        busy
+        active
       ) {
         respond({ error: 'INVALID_RUN_OR_BUSY' });
         return;
       }
-      busy = true;
+      active = { adapter, nonce: message.nonce };
       void adapter
         .run(job, async () => {
           const answer: unknown = await chrome.runtime.sendMessage({
@@ -67,7 +81,7 @@ function registerContentScript(): void {
         })
         .then(respond)
         .finally(() => {
-          busy = false;
+          active = undefined;
         });
       return true;
     } catch {

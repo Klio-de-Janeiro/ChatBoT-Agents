@@ -42,7 +42,6 @@ type Probe = {
   message_count: number;
   draft: boolean;
   busy?: boolean;
-  visible?: boolean;
   error?: string;
 };
 type Pending = {
@@ -130,9 +129,15 @@ export class BrowserPlatform implements Platform {
       } catch {
         throw new Diagnostic('MISSING_TAB', 'Dedicated conversation tab was closed');
       }
-      if (tab.incognito || tab.url !== existing.url || originProvider(tab.url) !== job.provider)
+      if (
+        tab.incognito ||
+        tab.pendingUrl ||
+        originProvider(tab.url) !== job.provider ||
+        (tab.url !== existing.url &&
+          (!job.chat_url || savedChatUrl(job.provider, tab.url!) !== job.chat_url))
+      )
         throw new Diagnostic('TAB_NAVIGATED', 'Dedicated tab was navigated; inspect manually');
-      const probe = await this.probe(existing.tabId, config);
+      const probe = await this.probeExisting(job, existing.tabId, config);
       if (
         job.chat_url &&
         (savedChatUrl(job.provider, probe.url) !== job.chat_url || !probe.message_count)
@@ -143,7 +148,7 @@ export class BrowserPlatform implements Platform {
           'PROVIDER_NOT_READY',
           probe.error ?? 'Missing authenticated DOM evidence',
         );
-      return existing;
+      return { ...existing, url: probe.url };
     }
     if (job.operation !== 'open') {
       const prepared = await this.preparedTab(job);
@@ -164,13 +169,12 @@ export class BrowserPlatform implements Platform {
     // A source provider tab is the user's explicit profile context. Its content
     // script may have become stale after an extension reload. Authenticate only
     // in the fresh owned page below; never refresh or alter the user's chat.
-    // Each conversation has an active tab in an owned window. Real providers may
-    // defer rendering and event handling in inactive tabs; separate windows also
-    // preserve parallelism without changing the user's existing active tabs.
+    // A dedicated window gives the provider its own active document without
+    // selecting a tab in the user's window or taking keyboard focus.
     const workspace = await chrome.windows.create({
       url: job.chat_url ?? ORIGINS[job.provider] + catalog[job.provider].start,
       type: 'normal',
-      focused: true,
+      focused: false,
     });
     const created = workspace?.tabs?.[0];
     if (!created || created.id === undefined || workspace?.id === undefined)
@@ -186,9 +190,15 @@ export class BrowserPlatform implements Platform {
     return conversation;
   }
 
-  private async waitForConversation(job: Job, config: ProviderConfig, id: number): Promise<Probe> {
+  private async waitForConversation(
+    job: Job,
+    config: ProviderConfig,
+    id: number,
+    previousDocument?: string,
+  ): Promise<Probe> {
     const until = Date.now() + Math.min(job.timeout_ms, 20_000);
     let last = 'DOM_UNSUPPORTED: New tab did not become ready';
+    let resetAttempted = false;
     while (Date.now() < until) {
       const tab = await chrome.tabs.get(id);
       if (tab.url && tab.url !== 'about:blank' && originProvider(tab.url) !== job.provider)
@@ -198,6 +208,10 @@ export class BrowserPlatform implements Platform {
         );
       try {
         const probe = await this.probe(id, config);
+        if (tab.pendingUrl || tab.url !== probe.url || probe.document_token === previousDocument) {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          continue;
+        }
         if (probe.ready && probe.signedIn) {
           if (job.chat_url) {
             if (savedChatUrl(job.provider, probe.url) !== job.chat_url)
@@ -207,20 +221,36 @@ export class BrowserPlatform implements Platform {
               await new Promise((resolve) => setTimeout(resolve, 150));
               continue;
             }
-          } else if (
-            !catalog[job.provider].home.includes(
-              new URL(probe.url).pathname.replace(/\/$/, '') || '/',
-            )
-          )
+          } else if (!this.isEmptyChat(job, probe)) {
+            if (!resetAttempted && !probe.busy && !probe.draft) {
+              resetAttempted = true;
+              const reset = await chrome.tabs
+                .sendMessage(
+                  id,
+                  {
+                    type: 'new-chat',
+                    config,
+                    document_token: probe.document_token,
+                    url: probe.url,
+                  },
+                  { frameId: 0 },
+                )
+                .catch(() => false);
+              if (reset === true) {
+                last = 'NEW_CHAT_NOT_EMPTY: Provider did not clear the restored conversation';
+                await new Promise((resolve) => setTimeout(resolve, 150));
+                continue;
+              }
+            }
+            if (last.startsWith('NEW_CHAT_NOT_EMPTY')) {
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              continue;
+            }
             throw new Diagnostic(
               'NEW_CHAT_NOT_EMPTY',
-              'Provider restored a conversation URL; no prompt sent',
+              'Provider restored a conversation; no prompt sent',
             );
-          if (!job.chat_url && probe.message_count)
-            throw new Diagnostic(
-              'NEW_CHAT_NOT_EMPTY',
-              'Provider opened an existing chat; no prompt sent',
-            );
+          }
           return probe;
         }
         if (probe.error) last = probe.error;
@@ -235,7 +265,16 @@ export class BrowserPlatform implements Platform {
       }
       await new Promise((r) => setTimeout(r, 150));
     }
+    if (last.startsWith('NEW_CHAT_NOT_EMPTY'))
+      throw new Diagnostic(
+        'NEW_CHAT_NOT_EMPTY',
+        'Provider did not clear the restored conversation; no prompt sent',
+      );
     throw new Diagnostic('NEW_CHAT_NOT_READY', last);
+  }
+  private isEmptyChat(job: Job, probe: Probe): boolean {
+    const path = new URL(probe.url).pathname.replace(/\/$/, '') || '/';
+    return catalog[job.provider].home.includes(path) && probe.message_count === 0;
   }
   private async rememberOpen(job: Job, conversation: Conversation): Promise<void> {
     await chrome.storage.session.set({
@@ -250,9 +289,10 @@ export class BrowserPlatform implements Platform {
     if (!saved) return;
     const tab = await chrome.tabs.get(saved.tabId).catch(() => undefined);
     if (!tab || tab.incognito || originProvider(tab.url) !== job.provider) return;
-    if (tab.url !== saved.url || tab.pendingUrl)
-      throw new Diagnostic('TAB_NAVIGATED', 'The prepared tab changed. Run open again.');
-    return { ...saved, prepared: true, token: crypto.randomUUID() };
+    if (tab.pendingUrl || !tab.url) return;
+    const exact = job.chat_url && savedChatUrl(job.provider, tab.url) === job.chat_url;
+    if (job.chat_url ? !exact : tab.url !== saved.url) return;
+    return { tabId: saved.tabId, url: tab.url, prepared: true, token: crypto.randomUUID() };
   }
 
   private async usePreparedTab(
@@ -280,7 +320,7 @@ export class BrowserPlatform implements Platform {
       !/^(LOGIN_REQUIRED|CAPTCHA|QUOTA|PROVIDER_ERROR):/.test(probe.error ?? '')
     ) {
       await new Promise((resolve) => setTimeout(resolve, 150));
-      probe = await this.probe(conversation.tabId, config);
+      probe = await this.probeExisting(job, conversation.tabId, config);
     }
     if (!probe.ready || !probe.signedIn || probe.url !== tab.url)
       throw new Diagnostic(
@@ -294,18 +334,21 @@ export class BrowserPlatform implements Platform {
         'The prepared tab contains an unsent draft; use --replace-draft to discard it',
       );
     const site = catalog[job.provider];
-    const currentPath = new URL(probe.url).pathname.replace(/\/$/, '') || '/';
     const needsNavigation = job.chat_url
       ? savedChatUrl(job.provider, probe.url) !== job.chat_url
-      : !site.home.includes(currentPath) || probe.message_count > 0;
+      : !this.isEmptyChat(job, probe);
     if (job.chat_url && !needsNavigation && !probe.message_count)
       throw new Diagnostic('CHAT_HISTORY_MISSING', 'The saved chat has no recognizable history');
     if (needsNavigation) {
+      const current = await chrome.tabs.get(conversation.tabId);
+      if (current.pendingUrl || current.url !== probe.url)
+        throw new Diagnostic('TAB_NAVIGATED', 'The prepared tab changed before navigation');
       await chrome.tabs.update(conversation.tabId, {
         url: job.chat_url ?? site.origin + site.start,
-        active: true,
       });
-      conversation.url = (await this.waitForConversation(job, config, conversation.tabId)).url;
+      conversation.url = (
+        await this.waitForConversation(job, config, conversation.tabId, probe.document_token)
+      ).url;
     }
     // Transfer only the chosen tab. Moving it between windows keeps the same tab ID.
     await chrome.storage.session.set({
@@ -335,12 +378,14 @@ export class BrowserPlatform implements Platform {
     if (!tab) {
       const keys = tabs.map((candidate) => `tab:${candidate.id}`);
       const ownership = await chrome.storage.session.get(keys);
-      tab = tabs.find((candidate) => !ownership[`tab:${candidate.id}`]) ?? tabs[0]!;
+      tab = tabs.find((candidate) => !ownership[`tab:${candidate.id}`]);
+      if (!tab && !job.chat_url) tab = tabs[0];
     }
+    if (!tab) return;
     return { tabId: tab.id!, url: tab.url!, token: '', view: true };
   }
 
-  private async activateView(
+  private async openView(
     job: Job,
     conversation: Conversation,
     config: ProviderConfig,
@@ -371,15 +416,8 @@ export class BrowserPlatform implements Platform {
         throw new Diagnostic('TAB_NAVIGATED', 'The existing tab changed; run open again');
     }
 
-    await chrome.tabs.update(
-      tabId,
-      navigate ? { url: job.chat_url, active: true } : { active: true },
-    );
-    const window = await chrome.windows.get(tab.windowId);
-    if (window.state === 'minimized')
-      await chrome.windows.update(tab.windowId, { state: 'normal' });
-    await chrome.windows.update(tab.windowId, { focused: true });
     if (!navigate) return url;
+    await chrome.tabs.update(tabId, { url: job.chat_url });
 
     const until = Date.now() + Math.min(job.timeout_ms, 20_000);
     while (Date.now() < until) {
@@ -430,7 +468,7 @@ export class BrowserPlatform implements Platform {
   ): Promise<Result> {
     const config = settings.providers[job.provider];
     if (conversation.view && job.operation === 'open') {
-      conversation.url = await this.activateView(job, conversation, config);
+      conversation.url = await this.openView(job, conversation, config);
       if (!Object.keys(job.modes ?? {}).length) {
         await this.rememberOpen(job, conversation);
         return result(job, 'completed', undefined, '', conversation.url);
@@ -438,7 +476,6 @@ export class BrowserPlatform implements Platform {
     }
     const prepared = conversation.prepared === true;
     if (prepared) await this.usePreparedTab(job, conversation, config);
-    const tab = await chrome.tabs.get(conversation.tabId);
     const tabKey = `tab:${conversation.tabId}`;
     const ownership = (await chrome.storage.session.get(tabKey))[tabKey];
     if (ownership !== conversation.token && !(conversation.view && job.operation === 'open'))
@@ -446,30 +483,11 @@ export class BrowserPlatform implements Platform {
         'WORKSPACE_REQUIRED',
         'The tab is no longer assigned to this conversation',
       );
-    const window = await chrome.windows.get(tab.windowId);
-    if (window.state === 'minimized')
-      throw new Diagnostic(
-        'WORKSPACE_MINIMIZED',
-        'Restore the work window before running a new job',
-      );
-    if (!tab.active) await chrome.tabs.update(conversation.tabId, { active: true });
-    if (job.operation !== 'open' && !window.focused)
-      await chrome.windows.update(tab.windowId, { focused: true });
-    const probeTab = () => this.probeExisting(job, conversation.tabId, config);
-    let probe = await probeTab();
-    if (job.operation !== 'open') {
-      const until = Date.now() + Math.min(2_000, job.timeout_ms);
-      while (probe.visible === false && Date.now() < until) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        probe = await probeTab();
-      }
-      if (probe.visible === false)
-        throw new Diagnostic(
-          'WORKSPACE_HIDDEN',
-          'Bring the provider tab to the foreground before asking',
-        );
-    }
-    if (probe.url !== conversation.url)
+    const probe = await this.probeExisting(job, conversation.tabId, config);
+    if (
+      probe.url !== conversation.url &&
+      (!job.chat_url || savedChatUrl(job.provider, probe.url) !== job.chat_url)
+    )
       throw new Diagnostic('TAB_NAVIGATED', 'Conversation URL changed before submission');
     const nonce = crypto.randomUUID();
     this.pending.set(job.request_id, {
@@ -490,6 +508,23 @@ export class BrowserPlatform implements Platform {
       authorized: false,
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let polling = false;
+    // Background tabs can throttle their own timers. Wake the DOM checks from
+    // the worker as well so checks and deadlines do not depend on tab focus.
+    const poll = setInterval(() => {
+      if (polling) return;
+      polling = true;
+      void chrome.tabs
+        .sendMessage(
+          conversation.tabId,
+          { type: 'poll', document_token: probe.document_token, nonce },
+          { frameId: 0 },
+        )
+        .catch(() => undefined)
+        .finally(() => {
+          polling = false;
+        });
+    }, 750);
     try {
       const response = await Promise.race([
         chrome.tabs.sendMessage(
@@ -518,6 +553,7 @@ export class BrowserPlatform implements Platform {
       return response;
     } finally {
       if (timer) clearTimeout(timer);
+      clearInterval(poll);
       this.pending.delete(job.request_id);
     }
   }

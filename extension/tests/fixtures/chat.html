@@ -29,7 +29,7 @@
   <body>
     <nav>
       <button aria-label="User menu" data-testid="user-menu">Signed-in account</button
-      ><a href="/">New chat</a>
+      ><a href="/" aria-label="New chat">New chat</a>
     </nav>
     <section id="mode-controls">
       <div class="ds-toggle-button" role="button" tabindex="0" aria-pressed="false">DeepThink</div>
@@ -154,6 +154,14 @@
         copy.textContent = 'Copy';
         article.append(copy);
       }
+      if (mode === 'restored' && location.pathname === '/') {
+        history.replaceState(null, '', '/a/chat/s/restored');
+        document.querySelector('nav a').onclick = (event) => {
+          event.preventDefault();
+          history.replaceState(null, '', '/');
+          messages.replaceChildren();
+        };
+      }
       if (location.pathname !== '/') {
         message('user', 'Earlier user prompt');
         completed(message('assistant', 'Earlier answer must never be returned'));
@@ -227,7 +235,7 @@
           completed(assistant);
           stop.remove();
           send.disabled = false;
-          history.replaceState(null, '', '/c/mock-' + Date.now());
+          if (mode !== 'saved-followup') history.replaceState(null, '', '/c/mock-' + Date.now());
           window.fixture.finished = Date.now();
         }, 650);
       };

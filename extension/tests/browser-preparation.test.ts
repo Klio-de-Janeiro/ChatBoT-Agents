@@ -39,7 +39,11 @@ function browserMock(probePatch: Record<string, unknown> = {}, hasSource = true)
           : [];
       },
       async get() {
-        return { id: 2, incognito: false, url: 'https://chat.deepseek.com/' };
+        return {
+          id: 2,
+          incognito: false,
+          url: String(probePatch.url ?? 'https://chat.deepseek.com/'),
+        };
       },
       async sendMessage(id: number) {
         if (id === 1) {
@@ -82,7 +86,7 @@ test('fresh owned page authenticates despite stale user-tab script; source tab u
   assert.deepEqual(calls.createOptions, {
     url: 'https://chat.deepseek.com/',
     type: 'normal',
-    focused: true,
+    focused: false,
   });
 });
 test('missing provider tab never creates a work window', async () => {

@@ -302,6 +302,25 @@ try {
       await page.close();
     },
   );
+  await check('open and ask leave the selected Chrome tab unchanged', async () => {
+    await options.bringToFront();
+    const selected = () =>
+      worker.evaluate(async () => {
+        const page = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
+        return page && { id: page.id, url: page.url };
+      });
+    const before = await selected();
+    assert.equal(before.url, options.url());
+    const opened = job('qwen', { operation: 'open' });
+    await dispatch(opened);
+    assert.equal((await response(opened)).status, 'completed');
+    assert.deepEqual(await selected(), before);
+    const ask = job('qwen');
+    await dispatch(ask);
+    const answer = await response(ask);
+    assert.equal(answer.status, 'completed', JSON.stringify(answer));
+    assert.deepEqual(await selected(), before);
+  });
   await check('open uses the same tab for a saved chat and preserves drafts', async () => {
     const page = await context.newPage();
     await page.goto(origins.deepseek + '/');
@@ -326,6 +345,45 @@ try {
     assert.equal(context.pages().length, count);
     assert.equal(await page.evaluate(() => fixture.clicks), 0);
     await page.close();
+  });
+  await check('new ask clears an automatically restored chat before sending', async () => {
+    await mode('deepseek', 'restored');
+    try {
+      const ask = job('deepseek');
+      await dispatch(ask);
+      const answer = await response(ask);
+      assert.equal(answer.status, 'completed', JSON.stringify(answer));
+      const page = context.pages().find((p) => p.url() === answer.conversation_url);
+      assert.ok(page);
+      assert.equal(await page.evaluate(() => fixture.clicks), 1);
+      assert.equal(await page.locator('[data-message-role="user"]').count(), 1);
+    } finally {
+      await mode('deepseek', 'stream');
+    }
+  });
+  await check('saved follow-up ignores a stale preparation for a different chat', async () => {
+    await mode('deepseek', 'saved-followup');
+    const page = await context.newPage();
+    const original = origins.deepseek + '/a/chat/s/other-chat';
+    const target = origins.deepseek + '/a/chat/s/follow-up-chat';
+    try {
+      await page.goto(original);
+      const viewed = job('deepseek', { operation: 'open', chat_url: original });
+      await dispatch(viewed);
+      assert.equal((await response(viewed)).status, 'completed');
+      await page.evaluate(() => history.replaceState(null, '', '?ref=restored'));
+      const ask = job('deepseek', { chat_url: target });
+      await dispatch(ask);
+      const answer = await response(ask);
+      assert.equal(answer.status, 'completed', JSON.stringify(answer));
+      assert.equal(answer.conversation_url, target);
+      assert.match(answer.text, new RegExp(ask.prompt));
+      assert.equal(await page.evaluate(() => fixture.clicks), 0);
+      assert.equal(page.url(), original + '?ref=restored');
+    } finally {
+      await page.close();
+      await mode('deepseek', 'stream');
+    }
   });
   await check('partial paused stream times out and quarantines conversation', async () => {
     await mode('deepseek', 'paused');

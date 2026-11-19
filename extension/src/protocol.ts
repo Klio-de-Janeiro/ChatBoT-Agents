@@ -137,6 +137,7 @@ export function savedChatUrl(provider: Provider, url: string): string | undefine
   if (url.length > 512 || /[\s\\]/.test(url) || originProvider(url) !== provider) return;
   const parsed = new URL(url);
   const path = parsed.pathname.replace(/\/+$/, '');
+  if (catalog[provider].home.includes(path || '/')) return;
   if (
     catalog[provider].resume_paths.some(
       (prefix) => path.startsWith(prefix) && /^[A-Za-z0-9_-]+$/.test(path.slice(prefix.length)),

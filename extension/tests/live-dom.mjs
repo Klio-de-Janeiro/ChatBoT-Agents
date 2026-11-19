@@ -54,12 +54,17 @@ try {
                 ? `<div class="ds-message d29f3d7d"><div class="fbb737a4"></div></div>
                <div class="ds-message"><div class="ds-markdown ds-assistant-message-main-content">Final answer</div></div>
                <div class="ds-flex"><div role="button">Copy</div></div>`
-                : `<div class="qwen-chat-message-user"><p class="user-message-content"></p></div>
+                : `<div class="qwen-chat-message-user"><div class="user-message"><p class="user-message-content"></p></div></div>
                <div class="qwen-chat-message-assistant"><div class="response-message-content"><div class="qwen-markdown">Final answer</div></div>
                <button class="qwen-chat-package-comp-new-action-control-container-copy">Copy</button></div>`;
             document.querySelector(
               provider === 'deepseek' ? '.fbb737a4' : '.user-message-content',
             ).textContent = prompt;
+            if (provider === 'qwen') {
+              document
+                .querySelector('.user-message-content')
+                .insertAdjacentHTML('beforeend', '<button type="button">Copy prompt</button>');
+            }
             if (replaceMessage === 'virtual-user') {
               const main = document.querySelector('main');
               main.innerHTML =
@@ -135,10 +140,11 @@ try {
 
   for (const provider of ['kimi', 'perplexity']) {
     const page = await browser.newPage();
-    await page.route('https://fixture.test/', (route) =>
+    const origin = provider === 'kimi' ? 'https://www.kimi.ai' : 'https://www.perplexity.ai';
+    await page.route(origin + '/**', (route) =>
       route.fulfill({ contentType: 'text/html', body: '<main></main>' }),
     );
-    await page.goto('https://fixture.test/');
+    await page.goto(origin + '/');
     await page.addScriptTag({ path: 'work/live-adapter.js' });
     await page.addScriptTag({ path: 'work/live-config.js' });
     const output = await page.evaluate(async (provider) => {
@@ -156,13 +162,31 @@ try {
       const send = document.querySelector(config.selectors.send.join(','));
       const path = kimi ? '/chat/test' : '/session/test';
       let historyPublished = false;
+      if (!kimi) {
+        // Mimic a controlled editor that only accepts text through its paste handler.
+        document.execCommand = () => false;
+        composer.addEventListener('paste', (event) => {
+          event.preventDefault();
+          composer.textContent = event.clipboardData.getData('text/plain');
+        });
+      }
       send.onclick = () => {
         const prompt = composer.innerText;
         composer.textContent = '';
         document.querySelector('main').innerHTML = kimi
           ? '<div class="segment-user"><div class="segment-content"><p class="user-content__text"></p><button>Copy</button></div></div><div class="segment-assistant"><div class="segment-content"><div>Thinking completed</div><div class="markdown">Answer</div><div class="segment-assistant-actions">Copy</div></div></div>'
           : '<div class="group/user-bubble"><p class="whitespace-pre-wrap"></p></div><div data-workflow-final-text><div class="prose">Answer</div><div data-workflow-text-footer><button aria-label="Copy">Copy</button></div></div>';
-        document.querySelector('main p').textContent = prompt;
+        const userText = document.querySelector('main p');
+        userText.textContent = prompt;
+        if (kimi) {
+          const user = userText.closest('.segment-user');
+          const answer = document.querySelector('.segment-assistant');
+          const thinking = answer.cloneNode(false);
+          thinking.textContent = 'Thinking';
+          answer.replaceWith(thinking);
+          setTimeout(() => user.replaceWith(user.cloneNode(true)), 100);
+          setTimeout(() => thinking.replaceWith(answer), 150);
+        }
         history.pushState(null, '', path);
         setTimeout(() => {
           const link = document.createElement('a');
@@ -187,7 +211,11 @@ try {
     assert.equal(output.response.text, 'Answer');
     assert.equal(new URL(output.response.conversation_url).pathname, output.path);
     assert.equal(output.historyPublished, true);
-    console.log('PASS saved conversation fixture: ' + provider);
+    console.log(
+      'PASS saved conversation fixture: ' +
+        provider +
+        (provider === 'kimi' ? ' with remounted prompt' : ''),
+    );
     await page.close();
   }
 } finally {

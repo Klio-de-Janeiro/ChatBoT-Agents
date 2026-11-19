@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -227,7 +226,15 @@ def test_cli_summary_exposes_markdown_paths_without_bodies(monkeypatch, tmp_path
     assert Path(receipt["output_markdown_path"]).read_text(encoding="utf-8") == MARKDOWN
 
 
-def test_clipboard_copy_uses_provider_markdown_verbatim(monkeypatch, capsys):
+@pytest.fixture
+def clipboard_cli_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("MCA_HOME", str(tmp_path))
+    monkeypatch.setenv("MCA_POLL_INTERVAL", "0.01")
+    # These tests advance the queue directly through Store instead of spawning a worker.
+    monkeypatch.setattr("multi_chat_agent.cli._background", lambda *_: None)
+
+
+def test_clipboard_copy_uses_provider_markdown_verbatim(monkeypatch, capsys, clipboard_cli_home):
     copied: dict[str, str] = {}
 
     def fake_copy(text: str) -> str:
@@ -235,83 +242,73 @@ def test_clipboard_copy_uses_provider_markdown_verbatim(monkeypatch, capsys):
         return "fake-clip"
 
     monkeypatch.setattr("multi_chat_agent.cli.copy_text", fake_copy)
-    with tempfile.TemporaryDirectory() as home:
-        monkeypatch.setenv("MCA_HOME", home)
-        monkeypatch.setenv("MCA_POLL_INTERVAL", "0.01")
-        assert main(["ask", "qwen", "--prompt", "Question", "--task-id", "clip"]) == 0
-        capsys.readouterr()
-        store = Store(Settings.from_env())
-        store.heartbeat("host")
-        command = store.claim("host")
-        assert store.accept_result("host", rich(command))
-        assert main(["status", "clip", "--wait"]) == 0
-        capsys.readouterr()
-        assert main(["copy", "clip"]) == 0
-        report = json.loads(capsys.readouterr().out)
-        assert report["format"] == "markdown"
-        assert report["clipboard"] == "fake-clip"
-        assert report["source_path"].endswith("answer.md")
-        # Exactly the provider bytes: tables, fences and formulas are untouched.
-        assert copied["text"] == MARKDOWN
-        assert MARKDOWN.strip() not in json.dumps(report)
+    assert main(["ask", "qwen", "--prompt", "Question", "--task-id", "clip"]) == 0
+    capsys.readouterr()
+    store = Store(Settings.from_env())
+    store.heartbeat("host")
+    command = store.claim("host")
+    assert store.accept_result("host", rich(command))
+    assert main(["status", "clip", "--wait"]) == 0
+    capsys.readouterr()
+    assert main(["copy", "clip"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["format"] == "markdown"
+    assert report["clipboard"] == "fake-clip"
+    assert report["source_path"].endswith("answer.md")
+    # Exactly the provider bytes: tables, fences and formulas are untouched.
+    assert copied["text"] == MARKDOWN
+    assert MARKDOWN.strip() not in json.dumps(report)
 
 
-def test_clipboard_copy_can_fall_back_to_the_plain_text(monkeypatch, capsys):
+def test_clipboard_copy_can_fall_back_to_the_plain_text(monkeypatch, capsys, clipboard_cli_home):
     copied: dict[str, str] = {}
     monkeypatch.setattr(
         "multi_chat_agent.cli.copy_text",
         lambda text: (copied.setdefault("text", text), "fake-clip")[1],
     )
-    with tempfile.TemporaryDirectory() as home:
-        monkeypatch.setenv("MCA_HOME", home)
-        monkeypatch.setenv("MCA_POLL_INTERVAL", "0.01")
-        assert main(["ask", "qwen", "--prompt", "Question", "--task-id", "clip-raw"]) == 0
-        capsys.readouterr()
-        store = Store(Settings.from_env())
-        store.heartbeat("host")
-        command = store.claim("host")
-        assert store.accept_result("host", rich(command))
-        assert main(["status", "clip-raw", "--wait"]) == 0
-        capsys.readouterr()
-        assert main(["copy", "clip-raw", "--raw"]) == 0
-        report = json.loads(capsys.readouterr().out)
-        assert report["format"] == "text"
-        assert copied["text"] == "plain answer"
+    assert main(["ask", "qwen", "--prompt", "Question", "--task-id", "clip-raw"]) == 0
+    capsys.readouterr()
+    store = Store(Settings.from_env())
+    store.heartbeat("host")
+    command = store.claim("host")
+    assert store.accept_result("host", rich(command))
+    assert main(["status", "clip-raw", "--wait"]) == 0
+    capsys.readouterr()
+    assert main(["copy", "clip-raw", "--raw"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["format"] == "text"
+    assert copied["text"] == "plain answer"
 
 
-def test_clipboard_copy_refuses_unfinished_tasks(monkeypatch, capsys):
-    with tempfile.TemporaryDirectory() as home:
-        monkeypatch.setenv("MCA_HOME", home)
-        assert main(["ask", "qwen", "--prompt", "Question", "--task-id", "unfinished"]) == 0
-        capsys.readouterr()
-        assert main(["copy", "unfinished"]) == 2
-        report = json.loads(capsys.readouterr().out)
-        assert report["error"] == "task_not_completed"
+def test_clipboard_copy_refuses_unfinished_tasks(capsys, clipboard_cli_home):
+    assert main(["ask", "qwen", "--prompt", "Question", "--task-id", "unfinished"]) == 0
+    capsys.readouterr()
+    assert main(["copy", "unfinished"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["error"] == "task_not_completed"
 
 
-def test_clipboard_copy_reports_missing_open_answer(monkeypatch, capsys):
-    with tempfile.TemporaryDirectory() as home:
-        monkeypatch.setenv("MCA_HOME", home)
-        assert main(["open", "qwen", "--task-id", "open-copy"]) == 0
-        capsys.readouterr()
-        store = Store(Settings.from_env())
-        store.heartbeat("host")
-        command = store.claim("host")
-        assert store.accept_result(
-            "host",
-            NativeResult(
-                type="result",
-                request_id=command["request_id"],
-                status="completed",
-                text="",
-                conversation_url="https://chat.qwen.ai/c/1",
-            ),
-        )
-        assert main(["status", "open-copy", "--wait"]) == 0
-        capsys.readouterr()
-        assert main(["copy", "open-copy"]) == 2
-        report = json.loads(capsys.readouterr().out)
-        assert report["error"] == "no_answer_to_copy"
+def test_clipboard_copy_reports_missing_open_answer(capsys, clipboard_cli_home):
+    assert main(["open", "qwen", "--task-id", "open-copy"]) == 0
+    capsys.readouterr()
+    store = Store(Settings.from_env())
+    store.heartbeat("host")
+    command = store.claim("host")
+    assert store.accept_result(
+        "host",
+        NativeResult(
+            type="result",
+            request_id=command["request_id"],
+            status="completed",
+            text="",
+            conversation_url="https://chat.qwen.ai/c/1",
+        ),
+    )
+    assert main(["status", "open-copy", "--wait"]) == 0
+    capsys.readouterr()
+    assert main(["copy", "open-copy"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["error"] == "no_answer_to_copy"
 
 
 def test_clipboard_utility_selection_and_structured_failure(monkeypatch):
@@ -339,10 +336,25 @@ def test_clipboard_pipes_bytes_without_shell_quoting(monkeypatch):
         return Completed()
 
     monkeypatch.setattr(clipboard.os, "name", "posix")
-    monkeypatch.setattr(clipboard.os, "uname", lambda: type("U", (), {"sysname": "Linux"})())
+    monkeypatch.setattr(clipboard.sys, "platform", "linux")
     monkeypatch.setattr(clipboard.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(clipboard.subprocess, "run", fake_run)
     text = 'Таблица | `code` | $(rm -rf /)\n```python\nprint("x")\n```\n'
     assert clipboard.copy_text(text) == "wl-copy"
     assert seen["command"] == ["/usr/bin/wl-copy"]
     assert seen["input"] == text.encode("utf-8")
+
+
+def test_windows_clipboard_sends_unicode_with_bom(monkeypatch):
+    from multi_chat_agent import clipboard
+
+    monkeypatch.setattr(clipboard, "candidates", lambda: [("clip", [])])
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: name)
+
+    def fake_run(command, **kwargs):
+        assert command == ["clip"]
+        assert kwargs["input"].decode("utf-16") == "Кириллица и √"
+        return clipboard.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(clipboard.subprocess, "run", fake_run)
+    assert clipboard.copy_text("Кириллица и √") == "clip"

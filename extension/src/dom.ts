@@ -12,6 +12,7 @@ import {
 import type { ProviderConfig } from './config';
 import { applyRequestedModes } from './modes';
 import { richAnswer, type RichAnswer } from './answers';
+import { newChatControls } from './provider-adapters';
 
 export const normalize = (s: string) =>
   s
@@ -20,6 +21,7 @@ export const normalize = (s: string) =>
     .trim();
 export type Probe = { ready: boolean; signedIn: boolean; error?: string; url: string };
 export class DomAdapter {
+  private wake?: () => void;
   constructor(
     public doc: Document,
     public config: ProviderConfig,
@@ -50,8 +52,47 @@ export class DomAdapter {
     return this.all(selectors, root)[0];
   }
   text(e: Element): string {
-    const body = this.first(this.config.selectors.text, e) ?? e;
+    const body = this.messageBody(e);
     return normalize((body as HTMLElement).innerText ?? body.textContent ?? '');
+  }
+  private messageBody(e: Element): Element {
+    return this.first(this.config.selectors.text, e) ?? e;
+  }
+  private userText(e: Element): string {
+    const body = this.messageBody(e);
+    const projected = body.cloneNode(true) as Element;
+    projected
+      .querySelectorAll('button,[role="button"],svg,[hidden],[aria-hidden="true"]')
+      .forEach((control) => control.remove());
+    projected.querySelectorAll('br').forEach((br) => br.replaceWith('\n'));
+    return normalize(projected.textContent ?? '');
+  }
+  private matchesPrompt(e: Element, prompt: string): boolean {
+    if (!this.isUser(e)) return false;
+    return this.text(e) === prompt || this.userText(e) === prompt;
+  }
+  startNewChat(provider: Job['provider']): boolean {
+    const probe = this.probe();
+    const composer = this.first(this.config.selectors.composer);
+    if (!probe.signedIn || !composer || normalize(this.value(composer))) return false;
+    if (this.first(this.config.selectors.generating)) return false;
+    // Only use a uniquely identified provider control. The site decides how to
+    // reset its client-side chat state; the extension never deletes history.
+    const controls = this.all([...newChatControls[provider]]).filter((control) =>
+      control.matches('a[href],button,[role="button"]'),
+    );
+    if (controls.length !== 1) return false;
+    const control = controls[0]!;
+    if (!(control instanceof this.doc.defaultView!.HTMLElement)) return false;
+    if (control.matches(':disabled,[aria-disabled="true"]')) return false;
+    if (control instanceof this.doc.defaultView!.HTMLAnchorElement) {
+      const url = new URL(control.href, probe.url);
+      const path = url.pathname.replace(/\/$/, '') || '/';
+      if (url.origin !== catalog[provider].origin || !catalog[provider].home.includes(path))
+        return false;
+    }
+    control.click();
+    return true;
   }
   diagnostic(): Diagnostic | undefined {
     const s = this.config.selectors;
@@ -105,16 +146,22 @@ export class DomAdapter {
   }
   // A provider may show a reply before updating its history or redirecting.
   private hasSavedThread(provider: Job['provider']): boolean {
-    const prefix = catalog[provider].thread;
-    if (!prefix) return true;
+    if (!catalog[provider].thread) return true;
     const { origin, pathname } = this.doc.location;
-    if (!pathname.startsWith(prefix) || pathname.length <= prefix.length) return false;
+    if (!savedChatUrl(provider, this.doc.location.href)) return false;
     return [...this.doc.querySelectorAll<HTMLAnchorElement>('a[href]')].some((link) => {
       return link.origin === origin && link.pathname === pathname;
     });
   }
   messages(): Element[] {
-    return this.all([...this.config.selectors.user, ...this.config.selectors.assistant]);
+    const all = this.all([...this.config.selectors.user, ...this.config.selectors.assistant]);
+    const candidates = new Set(all);
+    return all.filter((element) => {
+      for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+        if (candidates.has(parent) && this.isUser(parent) === this.isUser(element)) return false;
+      }
+      return true;
+    });
   }
   isUser(e: Element): boolean {
     return this.config.selectors.user.some((s) => e.matches(s));
@@ -134,6 +181,9 @@ export class DomAdapter {
       ? e.value
       : (e as HTMLElement).innerText;
   }
+  poll(): void {
+    this.wake?.();
+  }
   setValue(e: Element, value: string): void {
     const view = this.doc.defaultView!;
     if (e instanceof view.HTMLTextAreaElement || e instanceof view.HTMLInputElement) {
@@ -143,14 +193,27 @@ export class DomAdapter {
           : view.HTMLInputElement.prototype;
       Object.getOwnPropertyDescriptor(prototype, 'value')!.set!.call(e, value);
     } else if (e.getAttribute('contenteditable') === 'true') {
-      // execCommand inserts plaintext into controlled contenteditable editors (no HTML interpretation).
       (e as HTMLElement).focus();
       const selection = view.getSelection();
       const range = this.doc.createRange();
       range.selectNodeContents(e);
       selection?.removeAllRanges();
       selection?.addRange(range);
-      if (this.doc.execCommand(value ? 'insertText' : 'delete', false, value)) return;
+      if (value) {
+        // Controlled editors can handle their own plain-text paste even when
+        // Chrome cannot run an editing command in an unfocused document.
+        const clipboardData = new view.DataTransfer();
+        clipboardData.setData('text/plain', value);
+        const accepted = !e.dispatchEvent(
+          new view.ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }),
+        );
+        if (accepted || !e.isConnected || normalize(this.value(e)) === normalize(value)) return;
+      }
+      if (
+        this.doc.execCommand(value ? 'insertText' : 'delete', false, value) &&
+        normalize(this.value(e)) === normalize(value)
+      )
+        return;
       e.textContent = value;
     } else throw new Diagnostic('COMPOSER_UNSUPPORTED', 'Configured composer is not editable');
     e.dispatchEvent(
@@ -161,6 +224,9 @@ export class DomAdapter {
   async run(job: Job, authorize: () => Promise<void>): Promise<Result> {
     const start = Date.now(),
       deadline = start + job.timeout_ms;
+    const startUrl = this.doc.location.href;
+    const prompt = normalize(job.prompt);
+    const remountsTurn = job.provider === 'kimi' || job.provider === 'qwen';
     let clicked = false;
     let written: Element | undefined;
     let sent = false,
@@ -184,6 +250,7 @@ export class DomAdapter {
           done = true;
           observer?.disconnect();
           if (timer) clearTimeout(timer);
+          this.wake = undefined;
           resolve();
         };
         observer = new this.doc.defaultView!.MutationObserver(wake);
@@ -194,6 +261,7 @@ export class DomAdapter {
           characterData: true,
         });
         timer = setTimeout(wake, this.config.poll_ms);
+        this.wake = wake;
       });
     const onTargetChat = () =>
       !job.chat_url || savedChatUrl(job.provider, this.doc.location.href) === job.chat_url;
@@ -243,6 +311,8 @@ export class DomAdapter {
       let userIdentity: string | Element | undefined;
       let assistantIdentity: string | Element | undefined;
       let mismatchSince: number | undefined;
+      let missingUserSince: number | undefined;
+      let missingAnswerSince: number | undefined;
       const virtualKey = (element: Element | undefined): number | undefined => {
         if (job.provider !== 'deepseek' || !element?.matches('.ds-message')) return;
         const key = element
@@ -250,6 +320,7 @@ export class DomAdapter {
           ?.getAttribute('data-virtual-list-item-key');
         if (key && /^-?\d+$/.test(key)) return Number(key);
       };
+      written = composer;
       this.setValue(composer, job.prompt);
       if (normalize(this.value(composer)) !== normalize(job.prompt)) {
         await pause();
@@ -277,13 +348,16 @@ export class DomAdapter {
       sent = true;
       if (Date.now() >= deadline)
         throw new Diagnostic('DEADLINE', 'Deadline expired before click', 'timeout');
+      const currentComposer = this.first(this.config.selectors.composer);
       if (
         !onTargetChat() ||
+        (!job.chat_url && this.doc.location.href !== startUrl) ||
         this.messages().length !== baseline.length ||
         this.messages().some(
           (e, i) => this.identity(e) !== baselineIds[i] || this.text(e) !== baselineText[i],
         ) ||
-        normalize(this.value(composer)) !== normalize(job.prompt)
+        !currentComposer ||
+        normalize(this.value(currentComposer)) !== prompt
       )
         throw new Diagnostic(
           'TAB_INTERFERENCE',
@@ -328,14 +402,11 @@ export class DomAdapter {
         const fresh = messages.filter((e) => !baselineSet.has(this.identity(e)));
         if (!user && fresh.length) {
           const candidate = fresh[0]!;
-          if (!this.isUser(candidate) || this.text(candidate) !== normalize(job.prompt)) {
-            const kimiPending =
-              job.provider === 'kimi' &&
-              (!this.isUser(candidate) || !candidate.querySelector('.user-content__text'));
-            if (virtualKey(candidate) !== undefined || kimiPending) {
+          if (!this.matchesPrompt(candidate, prompt)) {
+            if (virtualKey(candidate) !== undefined || remountsTurn) {
               // Wait briefly for a provider to mount the role and its text.
               mismatchSince ??= Date.now();
-              if (Date.now() - mismatchSince < 600) {
+              if (Date.now() - mismatchSince < (remountsTurn ? 1600 : 600)) {
                 await pause();
                 continue;
               }
@@ -363,11 +434,17 @@ export class DomAdapter {
               currentUserKey !== undefined &&
               currentUserKey > 0;
             const identity = this.identity(first);
+            const remounted =
+              remountsTurn &&
+              !user.isConnected &&
+              typeof userIdentity !== 'string' &&
+              typeof identity !== 'string';
             if (
-              (!reconciled && identity !== userIdentity) ||
-              this.text(first) !== normalize(job.prompt)
+              (!reconciled && !remounted && identity !== userIdentity) ||
+              !this.matchesPrompt(first, prompt)
             )
               throw new Diagnostic('PROMPT_CHANGED', 'Captured prompt changed', 'unknown');
+            missingUserSince = undefined;
             user = first;
             userIdentity = identity;
             answer = fresh[1];
@@ -394,6 +471,13 @@ export class DomAdapter {
               await pause();
               continue;
             }
+          } else if (remountsTurn && !user.isConnected) {
+            missingUserSince ??= Date.now();
+            if (Date.now() - missingUserSince < 1600) {
+              await pause();
+              continue;
+            }
+            throw new Diagnostic('PROMPT_CHANGED', 'Captured prompt did not reappear', 'unknown');
           } else {
             throw new Diagnostic('PROMPT_CHANGED', 'Captured prompt changed', 'unknown');
           }
@@ -403,14 +487,33 @@ export class DomAdapter {
               'Unexpected extra turn in dedicated tab',
               'unknown',
             );
-          if (!assistant && answer) {
+          if (
+            !assistant &&
+            answer &&
+            (job.provider !== 'kimi' || this.first(this.config.selectors.text, answer))
+          ) {
             assistant = answer;
             assistantIdentity = this.identity(answer);
           }
           if (assistant) {
             progress.assistantSeen = true;
             progress.phase = 'await_completion';
-            if (!answer || this.identity(answer) !== assistantIdentity)
+            if (!answer && remountsTurn && !assistant.isConnected) {
+              missingAnswerSince ??= Date.now();
+              if (Date.now() - missingAnswerSince < 1600) {
+                await pause();
+                continue;
+              }
+            }
+            missingAnswerSince = undefined;
+            const remounted =
+              remountsTurn &&
+              answer &&
+              !assistant.isConnected &&
+              typeof assistantIdentity !== 'string' &&
+              typeof this.identity(answer) !== 'string' &&
+              this.text(answer).startsWith(lastText);
+            if (!answer || (this.identity(answer) !== assistantIdentity && !remounted))
               throw new Diagnostic(
                 'ANSWER_CHANGED',
                 'Captured assistant message was replaced',
@@ -418,6 +521,7 @@ export class DomAdapter {
               );
             if (answer !== assistant) stableSince = Date.now();
             assistant = answer;
+            assistantIdentity = this.identity(answer);
             const text = this.text(assistant);
             partialText = text;
             if (text !== lastText) {
@@ -504,6 +608,7 @@ export class DomAdapter {
       }
       observer?.disconnect();
       if (timer) clearTimeout(timer);
+      this.wake = undefined;
     }
   }
 }

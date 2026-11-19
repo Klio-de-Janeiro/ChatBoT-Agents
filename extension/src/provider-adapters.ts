@@ -1,4 +1,25 @@
 import type { ProviderConfig } from './config';
+import type { Provider } from './protocol';
+
+const labeledNewChat = [
+  '[aria-label="New chat" i]',
+  '[title="New chat" i]',
+  '[aria-label="Новый чат" i]',
+  '[title="Новый чат" i]',
+  '[data-testid="new-chat-button"]',
+];
+
+export const newChatControls: Record<Provider, readonly string[]> = {
+  deepseek: labeledNewChat,
+  qwen: labeledNewChat,
+  kimi: [...labeledNewChat, '[data-testid="new-chat"]'],
+  perplexity: [
+    ...labeledNewChat,
+    '[aria-label="New Thread" i]',
+    '[title="New Thread" i]',
+    '[aria-label="Новый тред" i]',
+  ],
+};
 
 const shared = {
   captcha: ['iframe[src*="captcha"]', 'iframe[src*="challenge"]'],
@@ -51,6 +72,11 @@ export const browserAdapters = {
       ],
       signedIn: [
         'a[href="/library"]',
+        'a[href^="/library/"]',
+        'nav a[href^="/session/"]',
+        'aside a[href^="/session/"]',
+        'nav a[href^="/search/"][aria-current="page"]',
+        'aside a[href^="/search/"][aria-current="page"]',
         'button[aria-label="Поиск по сессиям"]',
         'button[aria-label="Search sessions"]',
       ],
